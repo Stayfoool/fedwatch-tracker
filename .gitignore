@@ -1,0 +1,12 @@
+node_modules/
+.wrangler/
+logs/
+report/
+.playwright-cli/
+output/
+__pycache__/
+*.pyc
+*.token
+.env
+.env.*
+.DS_Store

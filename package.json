@@ -1,0 +1,9 @@
+{
+  "name": "fedwatch-tracker-deploy",
+  "version": "1.0.0",
+  "description": "Daily CME FedWatch probability snapshots, FOMC history, event annotations, and Cloudflare Pages tooling",
+  "devDependencies": {
+    "agent-browser": "0.27.0",
+    "wrangler": "4.131.1"
+  }
+}
