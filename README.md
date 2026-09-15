@@ -14,7 +14,7 @@
 
 每日 10:00 北京时间采集、累积起来，看板就会形成 3 条"市场对该会议加息预期的最大概率"折线图。
 
-公开站点：<https://fedwatch-tracker.pages.dev/>。站点继续托管在 Cloudflare Pages；托管平台本身不会阻止搜索收录。项目已经从单一 JS 看板升级为可抓取的多页静态站点，包含会议历史页、方法页、数据下载页、中英文入口、robots、sitemap、结构化数据和真实 404。维护者姓名、组织、邮箱和联系方式目前不公开。
+公开站点：<https://fedwatch-tracker.pages.dev/>。公开代码仓库：<https://github.com/Stayfoool/fedwatch-tracker>。站点继续托管在 Cloudflare Pages；托管平台本身不会阻止搜索收录。项目已经从单一 JS 看板升级为可抓取的多页静态站点，包含会议历史页、方法页、数据下载页、中英文入口、robots、sitemap、结构化数据和真实 404。维护者姓名、组织、邮箱和联系方式目前不公开。
 
 ## 一、看板怎么看
 
