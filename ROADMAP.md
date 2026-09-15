@@ -117,7 +117,7 @@
 - [x] 部署脚本验证首页、robots、sitemap、历史页、CSV、Content-Type 和真实 404。
 - [x] 生产 deployment `be2bb859` 已验证与本地产物一致。
 - [x] 桌面和移动端本地浏览器 QA 通过，控制台无 error / warning。
-- [x] 已创建 Public GitHub 仓库 `https://github.com/Stayfoool/fedwatch-tracker`；初始提交已使用非个人提交身份，未上传 token、环境变量、日志、构建产物或维护者联系方式。
+- [x] 已创建 Public GitHub 仓库 `https://github.com/Stayfoool/fedwatch-tracker`；已设置站点 Homepage、MIT License 和主题标签（FedWatch / FOMC / Federal Reserve / interest rates 等）。初始提交已使用非个人提交身份，未上传 token、环境变量、日志、构建产物或维护者联系方式。
 
 ## 立即后续
 
