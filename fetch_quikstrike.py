@@ -455,7 +455,7 @@ def run_once(dry: bool = False, force: bool = False) -> dict:
     asof_ct = parse_page_asof(asof_raw)
     fresh, fresh_note = asof_freshness(asof_ct, now_ct())
 
-    cur_target = resolve_current_target(load_existing().values(),
+    cur_target = resolve_current_target(list(load_existing().values()),
                                         snapshot.get("meetings", []), usd)
     rows = to_rows(snapshot, captured_at_cn, usd, asof_raw, cur_target)
     meta = {
