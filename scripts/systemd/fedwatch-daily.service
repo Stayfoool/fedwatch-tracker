@@ -1,0 +1,17 @@
+[Unit]
+Description=FedWatch daily QuikStrike fetch, report build and publish
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=fedwatch
+Group=fedwatch
+WorkingDirectory=/opt/fedwatch-tracker
+Environment=PYTHON_BIN=/usr/bin/python3
+Environment=FEDWATCH_SITE_URL=http://8.215.88.73
+Environment=FEDWATCH_DEPLOY_SCRIPT=/opt/fedwatch-tracker/publish_report.sh
+ExecStart=/bin/zsh /opt/fedwatch-tracker/run_daily.sh
+ExecStartPost=/opt/fedwatch-tracker/sync_data_git.sh
+# 3 次抓取（间隔 10 分钟）+ 构建发布 + 3 次发布重试，留足余量
+TimeoutStartSec=3h

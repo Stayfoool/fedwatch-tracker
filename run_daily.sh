@@ -33,6 +33,9 @@ MAX=3             # 抓取总尝试次数
 SLEEP=600         # 抓取重试间隔：10 分钟
 DEPLOY_MAX=3      # 发布总尝试次数
 DEPLOY_SLEEP=60   # 发布重试间隔：1 分钟
+# 发布渠道：默认 Cloudflare Pages（Mac）；阿里云服务器的 systemd 服务通过
+# FEDWATCH_DEPLOY_SCRIPT 指向 publish_report.sh，把 report/ 发布到本地 nginx 站点。
+DEPLOY_SCRIPT=${FEDWATCH_DEPLOY_SCRIPT:-$DIR/deploy_pages.sh}
 
 # 使用项目内固定版本的 agent-browser，避免依赖交互式 shell 的 PATH。
 export PATH="$DIR/node_modules/.bin:$PATH"
@@ -104,7 +107,7 @@ fi
 deploy_attempt=1
 while [[ $deploy_attempt -le $DEPLOY_MAX ]]; do
   log "=== 第 $deploy_attempt/$DEPLOY_MAX 次发布尝试 $(date '+%F %T %Z')"
-  if "$DIR/deploy_pages.sh" 2>&1 | tee -a "$LOG"; then
+  if "$DEPLOY_SCRIPT" 2>&1 | tee -a "$LOG"; then
     log "OK 数据、报告与公开网站均已更新 $(date '+%F %T %Z')"
     exit 0
   fi

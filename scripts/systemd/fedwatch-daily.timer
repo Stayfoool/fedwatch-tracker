@@ -1,0 +1,13 @@
+[Unit]
+Description=FedWatch daily collection at 05:30 and 06:30 Beijing time
+
+[Timer]
+# 双触发与 Mac LaunchAgent 相同：夏令时 05:30、冬令时 06:30 命中芝加哥 16:30 收盘窗口，
+# 不在窗口内的那次由 fetch_quikstrike.py 以 exit 10 自行跳过。
+OnCalendar=*-*-* 05:30:00 Asia/Shanghai
+OnCalendar=*-*-* 06:30:00 Asia/Shanghai
+Persistent=true
+Unit=fedwatch-daily.service
+
+[Install]
+WantedBy=timers.target

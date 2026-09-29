@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# fedwatch-deploy — 服务器端部署器（安装到 /usr/local/sbin/，root 运行）。
+# 从 GitHub 拉取指定 commit，校验后重建静态站点并发布到 nginx 站点目录。
+# 由 Mac 端 deploy_server.sh 通过 SSH 触发；构建与发布以 fedwatch 用户执行。
+set -Eeuo pipefail
+
+APP=${APP:-/opt/fedwatch-tracker}
+RUN_AS=${RUN_AS:-fedwatch}
+SITE_URL=${FEDWATCH_SITE_URL:-http://8.215.88.73}
+LOG_DIR=/var/log/fedwatch
+REF=${1:-main}
+REQUESTED_COMMIT=${2:-}
+
+fail() { echo "fedwatch-deploy: $*" >&2; exit 1; }
+[[ "$(id -u)" == 0 ]] || fail "必须以 root 运行"
+[[ -d "$APP/.git" ]] || fail "缺少服务器仓库：$APP（先跑 scripts/server/bootstrap.sh）"
+[[ -f "$APP/build_report.py" ]] || fail "仓库内容异常：$APP/build_report.py 缺失"
+
+exec 9>"$APP/.deploy.lock"
+flock -n 9 || fail "另一个部署正在进行"
+
+mkdir -p "$LOG_DIR"
+exec > >(tee -a "$LOG_DIR/deploy.log") 2>&1
+trap 'echo "fedwatch-deploy: 命令在第 $LINENO 行失败: $BASH_COMMAND" >&2' ERR
+
+cd "$APP"
+runuser -u "$RUN_AS" -- git fetch --quiet origin
+if [[ -n "$REQUESTED_COMMIT" ]]; then
+  runuser -u "$RUN_AS" -- git cat-file -e "$REQUESTED_COMMIT^{commit}" 2>/dev/null \
+    || runuser -u "$RUN_AS" -- git fetch --quiet origin main
+  COMMIT=$(runuser -u "$RUN_AS" -- git rev-parse "$REQUESTED_COMMIT^{commit}")
+else
+  COMMIT=$(runuser -u "$RUN_AS" -- git rev-parse "origin/${REF#origin/}^{commit}")
+fi
+[[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || fail "无法解析 commit（ref=$REF）"
+runuser -u "$RUN_AS" -- git merge-base --is-ancestor "$COMMIT" origin/main \
+  || fail "commit 不在 origin/main 历史中：$COMMIT"
+
+CURRENT=$(runuser -u "$RUN_AS" -- git rev-parse HEAD 2>/dev/null || echo none)
+if [[ "$COMMIT" == "$CURRENT" && -f "$APP/report/index.html" ]]; then
+  echo "fedwatch-deploy: 已是目标 commit $COMMIT，跳过重建"
+  exit 0
+fi
+
+runuser -u "$RUN_AS" -- git reset --quiet --hard "$COMMIT"
+echo "fedwatch-deploy: checkout $COMMIT"
+
+# package-lock 未变化时跳过 npm ci（agent-browser/wrangler 二进制较大）
+LOCK_SHA=$(sha256sum "$APP/package-lock.json" | cut -d' ' -f1)
+if [[ ! -d "$APP/node_modules" || "$LOCK_SHA" != "$(cat "$APP/.node-modules.sha" 2>/dev/null || echo none)" ]]; then
+  echo "fedwatch-deploy: npm ci"
+  runuser -u "$RUN_AS" -- bash -c "cd '$APP' && npm ci --no-fund --no-audit --silent"
+  echo "$LOCK_SHA" > "$APP/.node-modules.sha"
+  runuser -u "$RUN_AS" -- bash -c "cd '$APP' && ./node_modules/.bin/agent-browser install --with-deps 2>/dev/null || ./node_modules/.bin/agent-browser install"
+fi
+
+export FEDWATCH_SITE_URL="$SITE_URL"
+runuser -u "$RUN_AS" -- bash -c "cd '$APP' && python3 -m py_compile *.py"
+runuser -u "$RUN_AS" -- bash -c "cd '$APP' && python3 snapshot_pick.py"
+runuser -u "$RUN_AS" -- bash -c "cd '$APP' && python3 build_report.py"
+runuser -u "$RUN_AS" -- bash -c "cd '$APP' && python3 build_curves.py" \
+  || echo "fedwatch-deploy: curves.html 生成失败（不阻断）"
+
+runuser -u "$RUN_AS" -- "$APP/publish_report.sh"
+echo "fedwatch-deploy: 完成 commit=$COMMIT site=$SITE_URL"
