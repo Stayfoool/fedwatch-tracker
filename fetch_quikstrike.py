@@ -63,7 +63,11 @@ QUIKSTRIKE_URL = (
     "?viewitemid=IntegratedFedWatchTool"
 )
 CME_REFERER = "https://www.cmegroup.com/markets/interest-rates/cme-fedwatch-tool.html"
-HEADERS_JSON = json.dumps({"Referer": CME_REFERER})
+# Accept-Language 决定 QuikStrike 的区域格式（会议日期 YYYY/M/D、Data-as-of 中文月名
+# 都是 zh-CN 会话的产物）。服务器托管 Chrome 默认 en-US 会给出 MM/DD/YYYY + PM 时间，
+# 下游 parse_page_asof 不认；固定成 zh-CN 与 Mac 端完全同构。
+HEADERS_JSON = json.dumps({"Referer": CME_REFERER,
+                           "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"})
 
 # FedWatch Aggregated 列的固定区间宽度（页面表格布局，与目标区间无关）
 RANGES = [
@@ -204,10 +208,12 @@ EXTRACT_JS = r"""
       }
       for (const r of rows) {
         const cells = [...r.querySelectorAll('th, td')].map(c => c.textContent.trim());
-        const m = cells[0] && cells[0].match(/^(\d{4})\/(\d+)\/(\d+)$/);
+        // 会话区域格式两种都可能：YYYY/M/D（zh-CN）或 M/D/YYYY（en-US）
+        const m = cells[0] && (cells[0].match(/^(\d{4})\/(\d+)\/(\d+)$/) || cells[0].match(/^(\d+)\/(\d+)\/(\d{4})$/));
         if (m) {
           const probs = cells.slice(1).map(s => parseFloat(s));
-          const ymd = m[1] + '-' + String(m[2]).padStart(2,'0') + '-' + String(m[3]).padStart(2,'0');
+          const parts = /^\d{4}\//.test(cells[0]) ? [m[1], m[2], m[3]] : [m[3], m[1], m[2]];
+          const ymd = parts[0] + '-' + String(parts[1]).padStart(2,'0') + '-' + String(parts[2]).padStart(2,'0');
           out.meetings.push({
             meeting_date: ymd,
             ranges: headers.slice(1),
