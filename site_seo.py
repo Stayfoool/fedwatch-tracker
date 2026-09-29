@@ -562,7 +562,7 @@ def write_404() -> None:
 
 def write_llms(latest_key: str, latest: list[dict]) -> None:
     meeting_lines = "\n".join(
-        f"- {r['meeting_date']}: hike {pct(r.get('agg_p_hike_pct'))}, hold {pct(r.get('agg_p_hold_pct'))}, cut {pct(r.get('agg_p_cut_pct'))}; history {canonical(f'/meetings/{r['meeting_date']}/')}"
+        f"- {r['meeting_date']}: hike {pct(r.get('agg_p_hike_pct'))}, hold {pct(r.get('agg_p_hold_pct'))}, cut {pct(r.get('agg_p_cut_pct'))}; history {canonical('/meetings/%s/' % r['meeting_date'])}"
         for r in latest
     )
     text = f"""# FedWatch Tracker
