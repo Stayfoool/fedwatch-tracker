@@ -16,13 +16,26 @@
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
   </dict>
+  <!-- 两个触发器，覆盖美东夏令时与冬令时：
+       夏令时(CDT) 北京 05:30 = 前一日 16:30 CT
+       冬令时(CST) 北京 06:30 = 前一日 16:30 CT
+       两者都落在「收盘后休市间隙 [16:02,16:58) CT」内。
+       不在窗口内的那一次由 fetch_quikstrike.py 以 exit 10 自行跳过。 -->
   <key>StartCalendarInterval</key>
-  <dict>
-    <key>Hour</key>
-    <integer>10</integer>
-    <key>Minute</key>
-    <integer>0</integer>
-  </dict>
+  <array>
+    <dict>
+      <key>Hour</key>
+      <integer>5</integer>
+      <key>Minute</key>
+      <integer>30</integer>
+    </dict>
+    <dict>
+      <key>Hour</key>
+      <integer>6</integer>
+      <key>Minute</key>
+      <integer>30</integer>
+    </dict>
+  </array>
   <key>ProcessType</key>
   <string>Background</string>
   <key>ThrottleInterval</key>

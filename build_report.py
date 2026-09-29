@@ -6,9 +6,17 @@ build_report.py — 读取 data/fedwatch_probabilities.csv，
 
 核心图表：未来三次 FOMC 会议「最大概率加息水平」随时间变化折线图。
 
+横轴口径（2026-09-17 起）：**美东交易日**，取值来自 `us_trade_date` 列。
+一个点 = 美东一个交易日的收盘定格（详见 time_axis.py）。副标签写明该点的口径：
+「16:2xCT」（收盘后休市间隙读到的定格值）/「结算」（历史回填的结算值）/「盘中」（旧实时盘中读数）。
+`snapshot_cn` 仍是排序键与事件关联键，不用于显示。
+
 数据列：
-  snapshot_cn         — 北京时间采集时刻（主键之一）
-  snapshot_quikstrike — QuikStrike 页面 "Data as of" 时间戳
+  snapshot_cn         — 北京采集时刻（排序键 + 事件关联键；不显示）
+  us_trade_date       — 该数据对应的美东交易日（**横轴用这一列**）
+  data_asof_ct        — 页面自带的 "Data as of" 数据时点（规范化后）
+  time_basis          — 口径来源：page_asof / settlement_export / legacy_intraday
+  snapshot_quikstrike — 页面 "Data as of" 原文（含 "* Data as of ..."）
   meeting_date        — FOMC 会议日期
   current_target      — 当前目标区间，如 "350-375"
   agg_p_hike_pct      — 累计加息概率（Agg 口径）
@@ -29,6 +37,17 @@ from collections import defaultdict
 from datetime import date as date_t
 
 from site_seo import build_static_site, validate_site
+from snapshot_pick import pick_latest_snapshot
+from snapshot_view import displayed_by_day, remap_events_to_points, us_day_of
+from time_axis import asof_label, parse_page_asof
+from rate_baseline import (
+    FOMC_DECISION_DATES,
+    bucket_stats,
+    derive_target_eras,
+    discover_range_columns,
+    era_target_for,
+)
+from dual_charts import dual_charts_block
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CSV_PATH = os.path.join(BASE_DIR, "data", "fedwatch_probabilities.csv")
@@ -36,21 +55,6 @@ OUT = os.path.join(BASE_DIR, "report", "index.html")
 
 # 默认关注接下来 3 次会议；会自动按 meeting_date 升序取最新快照里最早的 3 个
 DEFAULT_NEXT_N = 3
-
-# FOMC 决议日（两日会议的第二天），用于在折线图中标注历史与未来会议。
-# 来源：Federal Reserve FOMC meeting calendars
-# https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm
-FOMC_DECISION_DATES = [
-    # 2025
-    "2025-01-29", "2025-03-19", "2025-05-07", "2025-06-18",
-    "2025-07-30", "2025-09-17", "2025-10-29", "2025-12-10",
-    # 2026
-    "2026-01-28", "2026-03-18", "2026-04-29", "2026-06-17",
-    "2026-07-29", "2026-09-16", "2026-10-28", "2026-12-09",
-    # 2027
-    "2027-01-27", "2027-03-17", "2027-04-28", "2027-06-09",
-    "2027-07-28", "2027-09-15", "2027-10-27", "2027-12-08",
-]
 
 # 把 bps 区间格式化成 "3.75% - 4.00%"
 def pretty_range(rng: str) -> str:
@@ -112,14 +116,24 @@ def series_max_pct(rows, meetings):
     QuikStrike 的 AllMeetings 历史文件会为尚未进入可计算窗口的远期会议
     写入全 0 占位行；这些行没有 max_range_label，不是实际的 0% 概率，
     因此必须跳过，折线应从该会议首次出现有效概率的日期开始。
+
+    去重（A 方案）：横轴一格 = 一个美东交易日，由 snapshot_view.displayed_by_day
+    统一裁决「当天那个点」（收盘定格 > 结算导出 > 盘中读数）。
+    **检测端（analyze_changes.py）用同一份规则**，两边不允许各写一套 ——
+    否则会出现「检测说这天有变动、图上却找不到那个点」。
     """
+    winners = displayed_by_day(rows)
     d = defaultdict(list)
     for r in rows:
         meeting = (r.get("meeting_date") or "").strip()
         snapshot = (r.get("snapshot_cn") or "").strip()
+        if not meeting or meeting not in meetings:
+            continue
+        if winners.get(us_day_of(r)) != snapshot:
+            continue                      # 这一天没轮到它出图
         label = (r.get("max_range_label") or "").strip()
         raw_pct = (r.get("max_range_pct") or "").strip()
-        if not meeting or not snapshot or not label or not raw_pct:
+        if not label or not raw_pct:
             continue
         try:
             pct = float(raw_pct)
@@ -133,13 +147,13 @@ def series_max_pct(rows, meetings):
     return {m: d[m] for m in meetings}
 
 
-def bps_axis_label(rng: str) -> str:
-    """如 '375-400' -> '+25bp' 或 '基准' 等简短标签。"""
+def bps_axis_label(rng: str, base_lo: int) -> str:
+    """如 '375-400' + 基准 350 → '+25bp'；等于基准 → '维持'。"""
     try:
         lo = int(rng.split("-")[0])
     except Exception:
         return rng
-    delta = (lo - 350) // 25
+    delta = (lo - base_lo) // 25
     if delta == 0:
         return "维持"
     if delta > 0:
@@ -147,27 +161,68 @@ def bps_axis_label(rng: str) -> str:
     return f"{delta*25}bp"
 
 
-def line_chart_max_pct(series_map, events_by_snap=None, width=920, height=380, today_label=None):
+def bucket_class(label: str, target: str) -> str:
+    """档位相对目标区间的类别：hike / hold / cut（共识色带着色用）。"""
+    try:
+        lo, hi = (int(x) for x in label.split("-"))
+        tl, th = (int(x) for x in target.split("-"))
+    except (ValueError, AttributeError):
+        return "hold"
+    if lo >= th:
+        return "hike"
+    if hi <= tl:
+        return "cut"
+    return "hold"
+
+
+def build_xmeta(rows) -> dict:
+    """{snapshot_cn: {"d": 美东交易日, "t": 口径副标签}} —— 横轴显示的唯一来源。
+
+    `d` 取 `us_trade_date`（缺失时退回原标签日期，保证老数据也能渲染）；
+    `t` 由 time_axis.asof_label 给出，让读者一眼看出这个点是「收盘定格 / 结算 / 盘中」。
+    """
+    out = {}
+    for r in rows:
+        s = (r.get("snapshot_cn") or "").strip()
+        if not s or s in out:
+            continue
+        out[s] = {
+            "d": (r.get("us_trade_date") or "").strip() or s[:10],
+            "t": asof_label(r),
+        }
+    return out
+
+
+def line_chart_max_pct(series_map, events_by_snap=None, width=920, height=380, today_label=None,
+                       data_meeting_dates=(), xmeta=None, cur_base="350-375", bands=None):
     """3 条会议曲线 + 数据点；可点击图例、可双滑块筛选日期范围、hover 显示 tooltip。
 
     X 轴刻度、折线 path/circle/end-label 都由 JS paint() 重画，
     Python 这边只输出静态骨架（Y 网格 + 3 个空 g.series + 十字线 + 命中层）。
 
+    xmeta: {snapshot_cn: {"d": 美东交易日, "t": 副标签}} —— 横轴与 tooltip 的显示来源。
+           `allx` 仍是 snapshot_cn（排序键），但**标签一律走 xmeta**。
     events_by_snap: 由 load_events() 得到的 {snapshot_cn: [{direction, summary, text, url}, ...]}
                     —— paint() 据此给「重大变动日」数据点加光环、tooltip 增加事件信号。
+    data_meeting_dates: 数据里实际存在的会议日期。与 FOMC_DECISION_DATES 取并集后作为
+                    图上会议标记，这样 FedWatch 天窗延伸到 2028 年及以后时，无需改代码
+                    就有标记（硬编码列表只用于补数据未覆盖的历史日期）。
     """
-    # pad_r 是绘图区右侧留白：既放各曲线末端标签，也作为 hover 浮窗的停靠区。
-    # 浮窗停靠在这里 → 与折线图零重叠，绝不会盖住任何数据点。
-    pad_l, pad_r, pad_t, pad_b = 60, 250, 32, 60
+    # 2026-09-29 三次调整：pad_r 12→190，与「方向与幅度」双图对齐 —— 线尾标签
+    # 重新画回右侧留白带（此前画在绘图区内侧右缘，会压住最右侧的数据点）；
+    # 悬停浮窗仍锚定绘图区右下角内侧（几何固定、不追鼠标，见 positionTip 注释）。
+    pad_l, pad_r, pad_t, pad_b = 50, 190, 32, 60
     allx = sorted({x for v in series_map.values() for x, _, _ in v})
     if not allx:
         return f'<svg width="{width}" height="60"></svg>'
     lo, hi = 0.0, 100.0
     pw, ph = width - pad_l - pad_r, height - pad_t - pad_b
 
+    xmeta = xmeta or {}
     chart_data = {
         "allx": allx,
         "n": len(allx),
+        "xmeta": xmeta,
         "lo": lo,
         "hi": hi,
         "pad_l": pad_l,
@@ -179,7 +234,9 @@ def line_chart_max_pct(series_map, events_by_snap=None, width=920, height=380, t
             r.split("-") for r in ("325-350","350-375","375-400","400-425","425-450","450-475","475-500")
         ],
         "events_by_snap": events_by_snap or {},
-        "fomc_dates": list(FOMC_DECISION_DATES),
+        "fomc_dates": sorted(set(FOMC_DECISION_DATES) | set(data_meeting_dates)),
+        "cur_base": cur_base,
+        "bands": bands or [],
         "series": [
             {
                 "md": m,
@@ -196,9 +253,11 @@ def line_chart_max_pct(series_map, events_by_snap=None, width=920, height=380, t
 
     parts = [
         f'<svg viewBox="0 0 {width} {height}" width="100%" class="linechart" '
-        f'style="max-width:{width}px;font-family:-apple-system,system-ui,sans-serif" '
+        f'style="display:block;font-family:-apple-system,system-ui,sans-serif" '
         f'data-pad-l="{pad_l}" data-pw="{pw}" data-pad-t="{pad_t}" data-ph="{ph}" '
-        f'data-n-x="{len(allx)}" data-lo="{lo}" data-hi="{hi}">'
+        f'data-n-x="{len(allx)}" data-lo="{lo}" data-hi="{hi}">',
+        # 共识色带层：垫在 Y 网格线之下，JS paint() 按日期筛选重画
+        '<g class="band-layer" aria-hidden="true"></g>',
     ]
     # Y 网格 + Y 轴标签（永久不变）
     for gv in range(0, 101, 20):
@@ -237,7 +296,7 @@ def line_chart_max_pct(series_map, events_by_snap=None, width=920, height=380, t
     return "".join(parts)
 
 
-def legend_html(meetings):
+def legend_html(meetings, focus=None):
     """可点击的图例按钮：切换对应会议折线的显示/隐藏。"""
     parts = []
     for idx, m in enumerate(meetings):
@@ -252,6 +311,16 @@ def legend_html(meetings):
             f'<span style="width:9px;height:9px;background:{color};border-radius:50%"></span>'
             f'{md} 会议</button>'
         )
+    if focus:
+        parts.append(
+            '<span class="chart-key" style="gap:4px">'
+            '<span style="display:inline-flex;gap:2px;align-items:center">'
+            '<span style="width:9px;height:9px;background:#fee2e2;border:1px solid #fca5a5;border-radius:2px"></span>'
+            '<span style="width:9px;height:9px;background:#f1f5f9;border:1px solid #cbd5e1;border-radius:2px"></span>'
+            '<span style="width:9px;height:9px;background:#dcfce7;border:1px solid #86efac;border-radius:2px"></span>'
+            '</span>'
+            f'背景＝{focus[5:]} 共识档（加/持/降）</span>'
+        )
     parts.append(
         '<span class="chart-key chart-key-meeting" aria-label="FOMC 会议日标记">'
         '<span class="chart-key-line" aria-hidden="true"></span>FOMC'
@@ -260,9 +329,10 @@ def legend_html(meetings):
     return "".join(parts)
 
 
-def hero_card(md: str, max_rng: str, max_pct: float, hike: float, hold: float, cut: float, color: str):
+def hero_card(md: str, max_rng: str, max_pct: float, hike: float, hold: float, cut: float,
+              color: str, base_lo: int):
     """3 个大卡片之一：当前最大概率区间 + 数值 + 累计加减息概率。"""
-    delta_text = bps_axis_label(max_rng)
+    delta_text = bps_axis_label(max_rng, base_lo)
     pretty = pretty_range(max_rng)
     return (
         f'<div style="background:linear-gradient(135deg,#ffffff 0%,#fafbff 100%);'
@@ -289,8 +359,8 @@ def hero_card(md: str, max_rng: str, max_pct: float, hike: float, hold: float, c
         f'</div>')
 
 
-def heatmap_table(latest_rows):
-    """Aggregated 全会议网格表（区间 × 会议）。"""
+def heatmap_table(latest_rows, base_lo: int = 350):
+    """Aggregated 全会议网格表（区间 × 会议）。颜色以 base_lo（现行目标下沿）分界。"""
     if not latest_rows:
         return ""
     ranges = []
@@ -309,11 +379,11 @@ def heatmap_table(latest_rows):
         cells = []
         for rng in ranges:
             v = d.get(rng, 0.0)
-            base = 350
+            base = base_lo
             try:
                 lo = int(rng.split("-")[0])
             except Exception:
-                lo = 350
+                lo = base
             color = "#dc2626" if lo > base else ("#16a34a" if lo < base else "#6b7280")
             opacity = max(0.04, min(1, v / 100))
             cells.append(
@@ -334,51 +404,99 @@ def main():
         print("暂无数据")
         return
 
-    # 取「最完整采集日」的最新一次快照（避免半截采集覆盖完整采集）
+    # 取最新一次采集，仅在疑似「半截采集」时回退（详见 snapshot_pick.py）
     by_snap = defaultdict(list)
     for r in rows:
         by_snap[r["snapshot_cn"]].append(r)
-    # 按 (会议数, snapshot_cn) 双排序选最完整且最新的
-    latest_cn = max(by_snap.keys(),
-                    key=lambda s: (len(by_snap[s]), s))
+    latest_cn = pick_latest_snapshot(by_snap)
+    newest_cn = max(by_snap)
+    if latest_cn != newest_cn:
+        print(f"WARN 最新采集 {newest_cn} 仅 {len(by_snap[newest_cn])} 个会议，"
+              f"疑似半截采集；已回退使用 {latest_cn}（{len(by_snap[latest_cn])} 个会议）")
     latest = by_snap[latest_cn]
-    cur_target = latest[0].get("current_target", "350-375")
+    # 会议数变化是「会议到期 / FedWatch 天窗伸缩」的信号，留在每日日志里便于回溯
+    prev_keys = [k for k in sorted(by_snap) if k < latest_cn]
+    prev_note = (f"（上一次采集 {prev_keys[-1]} 为 {len(by_snap[prev_keys[-1]])} 个会议）"
+                 if prev_keys else "")
+    print(f"快照 {latest_cn}：{len(latest)} 个会议{prev_note}")
     meetings = next_n_meetings(latest)
+    # 现行目标区间：动态推导（current_target 列在 9/16 加息后未更新过，不再采信）
+    range_cols = discover_range_columns(rows)
+    latest_us_day = (latest[0].get("us_trade_date") or latest_cn[:10]).strip()
+    fallback = next(((r.get("current_target") or "").strip() for r in reversed(rows)
+                     if (r.get("current_target") or "").strip()), "350-375")
+    eras = derive_target_eras(rows, range_cols, latest_us_day)
+    cur_base = era_target_for(latest_us_day, eras, fallback)
+    base_lo = int(cur_base.split("-")[0])
+    if eras:
+        print("现行目标区间:", cur_base, "| 时代切换:",
+              "; ".join(f"{d} → {t}" for d, t in eras))
     series = series_max_pct(rows, meetings)
 
-    # 3 个 hero 数据
+    # 3 个 hero 数据（加息/维持/降息按现行基准从桶分布现算，不读 agg 列）
     hero_data = []
     for idx, m in enumerate(meetings):
         rec = next((r for r in latest if r["meeting_date"] == m), None)
         if not rec:
             continue
+        st = bucket_stats(rec, range_cols, cur_base) or (0.0, 0.0, 0.0, 0.0, "", 0.0)
         hero_data.append({
             "md": m,
             "color": meeting_color(m, idx),
             "max_rng": rec.get("max_range_label", ""),
             "max_pct": float(rec.get("max_range_pct") or 0),
-            "hike": float(rec.get("agg_p_hike_pct") or 0),
-            "hold": float(rec.get("agg_p_hold_pct") or 0),
-            "cut": float(rec.get("agg_p_cut_pct") or 0),
+            "hike": st[0],
+            "hold": st[1],
+            "cut": st[2],
         })
 
     n_snap = len({r["snapshot_cn"] for r in rows})
     first_snap = min(r["snapshot_cn"] for r in rows)
     n_total_rows = len(rows)
+    xmeta = build_xmeta(rows)
+    latest_us = xmeta.get(latest_cn, {}).get("d", latest_cn[:10])
+    latest_note = xmeta.get(latest_cn, {}).get("t", "")
+    first_us = xmeta.get(first_snap, {}).get("d", first_snap[:10])
+    latest_desc = (f"美东 {latest_us} 收盘后（{latest_note}）" if latest_note not in ("", "盘中")
+                   else f"美东 {latest_us}（{latest_note}）")
 
     hero_html = "".join(
         hero_card(h["md"], h["max_rng"], h["max_pct"],
-                  h["hike"], h["hold"], h["cut"], h["color"])
+                  h["hike"], h["hold"], h["cut"], h["color"], base_lo)
         for h in hero_data)
     hero_grid = (
         '<div style="display:grid;grid-template-columns:repeat(3,1fr);'
         'gap:14px;margin-bottom:18px">'
         + hero_html + '</div>')
 
-    chart = line_chart_max_pct(series, events_by_snap=load_events(),
-                                width=920, height=380, today_label=latest_cn)
-    legend = legend_html(meetings)
-    grid = heatmap_table(latest)
+    # 「方向与幅度」双图（与 /curves 独立页共用 dual_charts 组件）
+    fomc_dates = sorted(set(FOMC_DECISION_DATES) | {r["meeting_date"] for r in rows})
+    dual_html, _dual_ctx = dual_charts_block(rows, meetings, xmeta, fomc_dates)
+
+    # 共识色带：焦点会议（最近一场未开完的 FOMC）每天的最大概率档位，
+    # 按时代基准分 hike/hold/cut 三色，相邻同档合并；色带边界 = 换档日
+    focus = meetings[0] if meetings else None
+    focus_md = focus[5:] if focus else ""
+    bands = []
+    if focus:
+        for snap, label, _pct in series.get(focus, []):
+            day = xmeta.get(snap, {}).get("d") or snap[:10]
+            cls = bucket_class(label, era_target_for(day, eras, fallback))
+            if bands and bands[-1]["rng"] == label:
+                continue
+            bands.append({"x": snap, "rng": label, "cls": cls})
+        if len(bands) > 1:
+            print(f"共识色带（{focus_md}）: {len(bands)} 段")
+
+    # 归因按美东交易日绑定到「当天那个点」：即便早晨的收盘定格顶掉了前一天的盘中读数，
+    # 光环与浮窗也不会挂空（2026-09-17 事故的直接修复）。
+    chart = line_chart_max_pct(series,
+                                events_by_snap=remap_events_to_points(load_events(), rows, series),
+                                width=952, height=380, today_label=latest_cn,
+                                data_meeting_dates={r["meeting_date"] for r in rows},
+                                xmeta=xmeta, cur_base=cur_base, bands=bands)
+    legend = legend_html(meetings, focus=focus)
+    grid = heatmap_table(latest, base_lo)
 
     today_str = date_t.today().isoformat()
 
@@ -482,19 +600,28 @@ tr:last-child td{{border-bottom:none}}
 .linechart.pinned .capture{{cursor:default !important}}
 </style></head><body><div class="wrap">
 <h1>CME FedWatch · 美联储加息概率追踪</h1>
-<div class="sub">数据来源 CME QuikStrike FedWatch 工具（Aggregated View） · 最近快照 {latest_cn}（北京时间；官网盘中实时值会随期货价格变动）</div>
+<div class="sub">数据来源 CME QuikStrike FedWatch 工具（Aggregated View） · 横轴＝<b>美东交易日</b>（一个点 = 该交易日收盘定格） · 最新数据点 {latest_desc}</div>
+<div class="sub" style="margin-bottom:16px"><a href="curves.html" style="color:#1d4ed8;font-weight:600;text-decoration:none">方向与幅度双图（累计加息概率 · 预期变动 bp）→</a>
+　口径恒定的互补视图：P(加息) 由低到高的完整过程 + 预期落点幅度，无「最大概率区间」切换跳变</div>
 
 <div class="card">
   <h2>下一三次 FOMC 会议 · 最大概率加息水平</h2>
   {hero_grid}
   <div class="note" style="margin-top:6px">
-  卡片显示截至 <b>{latest_cn}</b>，每个会议<b>当前市场预期概率最大的目标利率区间</b>，
+  卡片显示截至 <b>{latest_desc}</b>，每个会议<b>当前市场预期概率最大的目标利率区间</b>，
   以及累计加息/维持/降息概率分布。
   </div>
 </div>
 
+{dual_html}
+
 <div class="card">
-  <h2>「最大概率区间」概率走势（{len(meetings)} 条会议曲线）</h2>
+  <h2>市场共识档位与共识强度（{len(meetings)} 条会议曲线）</h2>
+  <div style="font-size:12.5px;color:#6b7280;margin:0 0 12px">
+  每条线 = 该会议<b>当前共识档位</b>（最大概率区间）的发生概率，即市场对其最集中押注结果的把握度。
+  <b>线下跌 ≠ 转鸽</b>——持稳共识瓦解、概率流向加息档时线同样下跌，宏观方向请看上方主图 A / 主图 B。
+  换档处折线断开（前后概率属于不同档位，不可比）；背景色 = 最近会议（{focus_md}）的共识档位：红=加息、灰=持稳、绿=降息。
+  </div>
   <div class="chart-container">
     <div class="chart-legend">{legend}</div>
     <div class="chart-controls">
@@ -522,16 +649,19 @@ tr:last-child td{{border-bottom:none}}
     X 轴刻度、十字线、浮窗都会自动对齐到所选区间。<br>
   · <b>FOMC 会议日</b>：图中的灰色垂直虚线与顶部 <b>FOMC</b> 小标签表示会议日期；
     日期不在当前筛选范围内时自动隐藏。<br>
-  · <b>重大变动标注</b>：橙/蓝色光环 + 实心点 = 当日某会议 max 概率日环比
+  · <b>重大变动标注</b>：橙/蓝色光环 + 实心点 = 当日某会议共识档概率日环比
     <b>绝对值 ≥ 8pp</b>，hover 弹窗会给出事件摘要与新闻链接；
-    橙色=图上线值上涨（hawk）、蓝色=图上线值下降（dove）。<br>
-  · <b>悬停浮窗</b>：浮窗停靠在折线图<b>右侧留白</b>处，与绘图区零重叠、
-    <b>不会遮挡任何数据点</b>；位置固定不跟随鼠标。<br>
+    橙色=当日共识档概率上涨、蓝色=下降。<b>注意：这只是线值方向，不是鹰/鸽结论</b>——
+    宏观方向请看上方主图 A（P(加息)）与主图 B（预期 bp）。<br>
+  · <b>悬停浮窗</b>：浮窗停靠在绘图区<b>右下角</b>（近期读数集中在图中上部，右下角遮挡最少）；
+    位置固定不跟随鼠标，鼠标移出后自动消失。<br>
   · <b>📌 点击固定（click to pin）</b>：鼠标移上去浮窗出现后，<b>点一下</b>即可把浮窗
     <b>钉住</b>（出现琥珀色描边与「已固定」提示），此时鼠标可从容移到浮窗上点
     「🔗 查看来源」；<b>再点一下</b>（图上或浮窗内任意处）即取消固定，回到悬停跟随模式。<br>
-  · <b>曲线变化来源</b>：① 该区间概率本身涨跌；② 不同日期「最大概率区间」标签切换
-    （如从 <code>+25bp</code> 切到 <code>+50bp</code>）。标签的视觉跳变对应市场对累计加息幅度的预期重定价。
+  · <b>读线规则</b>：线的涨跌只反映「当前共识档位的把握度」变化；换档日
+    （该会议最大概率区间切换，如 <code>+25bp</code> 档 → <code>+50bp</code> 档）折线<b>断开</b>，
+    前后两个概率属于不同档位、不可当涨跌比较——换档本身就是重要的重定价信息，
+    体现在色带边界与断口处。
   </div>
 </div>
 
@@ -550,22 +680,35 @@ tr:last-child td{{border-bottom:none}}
     通过浏览器自动化直接读取 QuikStrike Aggregated 表格，不再自行推导概率；比较时请以本站标注的采集时刻为准。<br>
   · <b>采集方式</b>：用 agent-browser 打开 QuikStrike → 点击 Aggregated tab → 从 DOM 表格抽取
     概率列；同时通过 <i>Downloads 面板</i> 的 "All upcoming meetings" CSV 一次性回填 1 年历史。<br>
-  · <b>采集节奏</b>：每日北京时间 <b>10:00</b> 触发；脚本内建 10 分钟 × 3 次重试
-    （<b>10:00 → 10:10 → 10:20</b>），任一次成功即停止；10:10 / 10:20 仅为失败重试。
-    官网是盘中实时页面，因此用户稍后打开官网时的概率可能高于或低于本站快照。<br>
-  · <b>交易日归档</b>：周末若 QuikStrike 仍返回上一交易日行情，折线按最近工作日归档；
-    原始实际抓取时刻保留在 <code>data/snapshots/YYYY-MM-DD.json</code>。<br>
+  · <b>采集节奏</b>：每日北京时间 <b>05:30</b> 与 <b>06:30</b> 各触发一次
+    （美国夏令时用 05:30、冬令时用 06:30，折算到芝加哥时间都是<b>前一日 16:30 CT</b>，
+    即 CME 收盘后的休市间隙）。不在窗口内的那次不会启动浏览器、也不会落盘。
+    失败则间隔 10 分钟重试，共 3 次（16:30 → 16:40 → 16:50 CT，均在窗口内）。<br>
+  · <b>时间口径</b>：<b>一个点 = 美东一个交易日的收盘定格值</b>。横轴标的是美东交易日，
+    副标签写明该点的口径：<code>16:2xCT</code>（收盘后读到）/ <code>结算</code>（历史回填的结算值）/
+    <code>盘中</code>（早期北京 10:00 采集的盘中读数）。
+    因北京无夏令时而美东有，采集点会比北京时间早一天出现在横轴上（北京 09-18 采集 → 横轴 09-17），
+    这是对的，不是数据延迟。官网是盘中实时页面，因此稍后打开官网看到的概率可能高于或低于本站快照。<br>
+  · <b>周末去重（A 方案）</b>：CME 周五 16:00 CT 收盘后要到周日 17:00 CT 才重开，
+    因此周六/周日/周一北京早上的三次采集读到的是<b>同一份周五收盘定格</b>。
+    本站按「一个交易日一个点」去重，<b>保留最早那一次</b>（周六那次），每周固定 5 个点。
+    每个快照的采集时钟都记在 <code>data/snapshots/YYYY-MM-DD.json</code>。<br>
   · <b>历史回填</b>：<code>backfill_history.py</code> 把 QuikStrike Downloads 面板里
     "All upcoming meetings" 的 CSV 拉下来一次性回填（约 <b>251 个交易日，1 年</b>）；
-    这些历史行是官方按交易日提供的日期级历史值，<code>10:00:00</code> 是统一标签，
-    不是盘中实时更新，也不替代当天的 10:00 定时快照。<br>
+    这些历史行是官方按交易日提供的<b>日期级结算值</b>，<code>snapshot_cn</code> 里的
+    <code>10:00:00</code> 只是当时的统一标签（副标签显示为「结算」），不代表时刻。<br>
   · <b>口径</b>：<b>最大概率区间</b>指 QuikStrike Aggregated/History 表中该会议
     所有目标区间概率最高的那一档；折线追踪这一档的概率变化。当区间标签切换时
     （如 <code>+25bp</code> → <code>+50bp</code>），线不会出现人为断点，而是直接连到
     新最大区间的概率位置。<br>
-  · <b>历史与实时共一张图</b>：存档从 <b>{first_snap[:10]}</b> 起累积到 <b>{latest_cn[:10]}</b>；
+  · <b>现行目标区间（加息/维持/降息的基准）</b>：取最近一次已开完 FOMC 决议后的目标，
+    由本站从该会议决议日最终读数的众数桶自动推导（当前：<b>{cur_base}</b>）。
+    卡片的累计加息/维持/降息、<code>+Xbp</code> 相对标签、热力图红/灰/绿分界均以它为准。
+    CSV 的 <code>current_target</code> 列自 2026-09-16 加息后未随决议更新，展示端不再采用；
+    更完整的方向/幅度双图见 <a href="curves.html" style="color:#1d4ed8">方向与幅度页</a>。<br>
+  · <b>历史与实时共一张图</b>：存档从美东交易日 <b>{first_us}</b> 起累积到 <b>{latest_us}</b>；
     共 <b>{n_snap}</b> 个采集日、<b>{n_total_rows}</b> 行。远期会议在尚未产生概率时会有全 0 占位行，
-    这些占位行不绘图；每条折线从该会议首次出现有效概率的日期开始，并随每天 10:00 自动累计。<br>
+    这些占位行不绘图；每条折线从该会议首次出现有效概率的日期开始，并随每个美东交易日自动累计。<br>
   · <b>文件位置</b>：长表 CSV <code>data/fedwatch_probabilities.csv</code>；
     原始历史 CSV <code>data/history/all_meetings_*.csv</code>；
     每日完整快照（含 ZQ 价格）<code>data/snapshots/YYYY-MM-DD.json</code>；
@@ -574,10 +717,10 @@ tr:last-child td{{border-bottom:none}}
 </div>
 <script>
 (function(){{
-  function bpsLabel(rng){{
+  function bpsLabel(rng, baseLo){{
     var m = /^[0-9]+/.exec(rng);
     if (!m) return rng;
-    var delta = (parseInt(m[0]) - 350) / 25;
+    var delta = (parseInt(m[0], 10) - baseLo) / 25;
     if (delta === 0) return '维持';
     if (delta > 0) return '+' + (delta * 25) + 'bp';
     return (delta * 25) + 'bp';
@@ -593,7 +736,7 @@ tr:last-child td{{border-bottom:none}}
       .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }}
   var DIR_COLOR = {{ hawk: '#fb923c', dove: '#60a5fa', neutral: '#9ca3af' }};
-  var DIR_LABEL = {{ hawk: '图上线值上涨', dove: '图上线值下降', neutral: '中性事件' }};
+  var DIR_LABEL = {{ hawk: '当日共识档概率上涨', dove: '当日共识档概率下降', neutral: '中性事件' }};
   var DIR_ICON  = {{ hawk: '🔺', dove: '🔻', neutral: '🔘' }};
 
   function initOne(container){{
@@ -624,6 +767,18 @@ tr:last-child td{{border-bottom:none}}
     var lo = +svg.dataset.lo, hi = +svg.dataset.hi;
     var meetingLayer = svg.querySelector('.meeting-layer');
     var VBW = data.viewBox_w;
+    // 相对 bp 标签的基准：现行目标区间下沿（后端按 FOMC 决议动态推导，见 rate_baseline.py）
+    var baseLo = parseInt((data.cur_base || '350-375').split('-')[0], 10) || 350;
+    var xmeta = data.xmeta || {{}};
+    // 横轴显示：日期取美东交易日，副标签取该点的口径（16:2xCT / 结算 / 盘中）
+    function xDate(snap){{ var m = xmeta[snap]; return (m && m.d) || snap.substring(0, 10); }}
+    function xNote(snap){{ var m = xmeta[snap]; return (m && m.t) || snap.substring(11, 16); }}
+    function xTip(snap){{
+      var d = xDate(snap), t = xNote(snap);
+      if (t === '结算') return d + '（结算值）';
+      if (t === '盘中') return d + '（盘中读数）';
+      return d + ' 收盘后 ' + t;
+    }}
 
     var currentStart = 0;
     var currentEnd = n - 1;
@@ -649,15 +804,59 @@ tr:last-child td{{border-bottom:none}}
         var rel = nTicks === 1 ? 0 : (k * (filteredN - 1) / (nTicks - 1));
         var i = startIdx + Math.round(rel);
         var xpos = px(i - startIdx);
+        // 贴边的刻度改单侧锚定，避免文字溢出 SVG 边界被裁切
+        var anchor = 'middle', tx = xpos;
+        if (k === 0 && xpos < 34) {{ anchor = 'start'; tx = 2; }}
+        if (k === nTicks - 1 && xpos > VBW - 34) {{ anchor = 'end'; tx = VBW - 2; }}
         var date = allx[i];
         svg.insertAdjacentHTML('beforeend',
-          '<text class="xtick" x="' + xpos.toFixed(1) + '" y="' + (pad_t + ph + 22) + '" '
-          + 'font-size="11" fill="#6b7280" text-anchor="middle">'
-          + date.substring(5, 10).replace('-', '/') + '</text>'
-          + '<text class="xtick" x="' + xpos.toFixed(1) + '" y="' + (pad_t + ph + 38) + '" '
-          + 'font-size="9.5" fill="#9ca3af" text-anchor="middle">'
-          + date.substring(11, 16) + '</text>'
+          '<text class="xtick" x="' + tx.toFixed(1) + '" y="' + (pad_t + ph + 22) + '" '
+          + 'font-size="11" fill="#6b7280" text-anchor="' + anchor + '">'
+          + xDate(date).substring(5, 10).replace('-', '/') + '</text>'
+          + '<text class="xtick" x="' + tx.toFixed(1) + '" y="' + (pad_t + ph + 38) + '" '
+          + 'font-size="9.5" fill="#9ca3af" text-anchor="' + anchor + '">'
+          + xNote(date) + '</text>'
         );
+      }}
+
+      // 共识色带：背景 = 焦点会议（最近一场未开完的 FOMC）当天的最大概率档位，
+      // 后端按时代基准分 hike/hold/cut 三色；色带边界 = 换档日，配琥珀细虚线。
+      // 方向类别变化且足够宽的色带才放文字标签，避免 5-6 月档位拉锯期文字叠成一团。
+      var bandLayer = svg.querySelector('.band-layer');
+      if (bandLayer) {{
+        bandLayer.innerHTML = '';
+        var bands = data.bands || [];
+        var infos = [];
+        bands.forEach(function(b){{
+          var bi2 = xIndex[b.x];
+          if (bi2 !== undefined) infos.push({{ idx: bi2, cls: b.cls, rng: b.rng }});
+        }});
+        var stepW = pw / Math.max(1, filteredN - 1);
+        for (var bk = 0; bk < infos.length; bk++) {{
+          var B = infos[bk];
+          if (B.idx > endIdx) break;
+          var s0 = Math.max(B.idx, startIdx);
+          var e0 = (bk + 1 < infos.length) ? Math.min(infos[bk + 1].idx - 1, endIdx) : endIdx;
+          if (e0 < s0) continue;
+          var bx1 = px(s0 - startIdx);
+          var bx2 = px(e0 - startIdx) + stepW;
+          var fill = B.cls === 'hike' ? '#fee2e2' : (B.cls === 'cut' ? '#dcfce7' : '#f1f5f9');
+          bandLayer.insertAdjacentHTML('beforeend',
+            '<rect x="' + bx1.toFixed(1) + '" y="' + pad_t + '" width="' + (bx2 - bx1).toFixed(1)
+            + '" height="' + ph + '" fill="' + fill + '"/>');
+          if (bk > 0 && B.idx >= startIdx && B.idx <= endIdx) {{
+            bandLayer.insertAdjacentHTML('beforeend',
+              '<line x1="' + bx1.toFixed(1) + '" y1="' + pad_t + '" x2="' + bx1.toFixed(1)
+              + '" y2="' + (pad_t + ph) + '" stroke="#d97706" stroke-width="1" '
+              + 'stroke-dasharray="2 3" opacity="0.45"/>');
+            var bandLen = ((bk + 1 < infos.length) ? infos[bk + 1].idx : n) - B.idx;
+            if (infos[bk - 1].cls !== B.cls && bandLen >= 6 && bx2 - bx1 > 60) {{
+              bandLayer.insertAdjacentHTML('beforeend',
+                '<text x="' + (bx1 + 3).toFixed(1) + '" y="' + (pad_t + 13) + '" '
+                + 'font-size="9.5" font-weight="700" fill="#92400e">共识 ' + B.rng + '</text>');
+            }}
+          }}
+        }}
       }}
 
       // FOMC 会议日：中性垂直虚线 + 顶部只显示「FOMC」小标签。
@@ -668,7 +867,7 @@ tr:last-child td{{border-bottom:none}}
         fomcDates.forEach(function(meetingDate){{
           var meetingIdx = -1;
           for (var mi = startIdx; mi <= endIdx; mi++) {{
-            if (allx[mi].substring(0, 10) === meetingDate) {{
+            if (xDate(allx[mi]) === meetingDate) {{
               meetingIdx = mi;
               break;
             }}
@@ -698,10 +897,15 @@ tr:last-child td{{border-bottom:none}}
         }});
         if (slice.length === 0) return;
         var color = s.color;
-        var pathD = slice.map(function(pt, j){{
+        // 换档处断线：换档前后是两个不同档位的概率，硬连会制造假涨跌
+        var pathD = '';
+        var prevRng = null;
+        slice.forEach(function(pt, j){{
           var xRel = xIndex[pt.x] - startIdx;
-          return (j === 0 ? 'M' : 'L') + px(xRel).toFixed(1) + ',' + py(pt.v).toFixed(1);
-        }}).join(' ');
+          var cmd = (j === 0 || pt.rng !== prevRng) ? 'M' : 'L';
+          pathD += (pathD ? ' ' : '') + cmd + px(xRel).toFixed(1) + ',' + py(pt.v).toFixed(1);
+          prevRng = pt.rng;
+        }});
         g.insertAdjacentHTML('beforeend',
           '<path d="' + pathD + '" fill="none" stroke="' + color + '" '
           + 'stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>'
@@ -735,26 +939,41 @@ tr:last-child td{{border-bottom:none}}
         }});
       }});
 
-      // 线尾标签避让：三条曲线概率接近时不要互相压住
+      // 线尾标签放右侧留白带（pad_r=190），纵向避让：先做顶部钳制再向下推开——
+      // 顺序反了的话钳制会压缩已算好的间距（与 dual_charts 同款修法）。
       endLabels.sort(function(a, b){{ return a.y - b.y; }});
-      var GAP = 38;
-      var yTop = pad_t + 18, yBot = pad_t + ph + 4;
+      var GAP = 44;
+      var yTop = pad_t + 6, yBot = pad_t + ph + 4;
+      for (var lc = 0; lc < endLabels.length; lc++){{
+        if (endLabels[lc].y < yTop) endLabels[lc].y = yTop;
+      }}
+      endLabels.sort(function(a, b){{ return a.y - b.y; }});
       for (var li = 1; li < endLabels.length; li++){{
         if (endLabels[li].y - endLabels[li - 1].y < GAP)
           endLabels[li].y = endLabels[li - 1].y + GAP;
       }}
       if (endLabels.length) {{
         var over = endLabels[endLabels.length - 1].y - yBot;
-        if (over > 0) {{
-          for (var lj = 0; lj < endLabels.length; lj++) endLabels[lj].y -= over;
-        }}
+        if (over > 0) {{ for (var lj = 0; lj < endLabels.length; lj++) endLabels[lj].y -= over; }}
+        var under = yTop - endLabels[0].y;
+        if (under > 0) {{ for (var lu = 0; lu < endLabels.length; lu++) endLabels[lu].y += under; }}
       }}
+      // 顶层标签图层：位于所有曲线之上、绘图区外；pointer-events:none 不挡 capture 层悬停
+      var labelLayer = svg.querySelector('.end-label-layer');
+      if (!labelLayer) {{
+        labelLayer = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+        labelLayer.setAttribute('class', 'end-label-layer');
+        labelLayer.setAttribute('pointer-events', 'none');
+        svg.appendChild(labelLayer);
+      }}
+      labelLayer.innerHTML = '';
       for (var lk = 0; lk < endLabels.length; lk++){{
         var L = endLabels[lk];
-        if (L.y < yTop) L.y = yTop;
-        L.g.insertAdjacentHTML('beforeend',
-          '<g class="end-label" transform="translate(' + (L.x + 10).toFixed(1) + ',' + (L.y - 12).toFixed(1) + ')">'
-          + '<rect x="0" y="-12" rx="4" width="180" height="34" fill="' + L.color + '" opacity="0.10"/>'
+        var labelLeft = pad_l + pw + 10;
+        labelLayer.insertAdjacentHTML('beforeend',
+          '<g class="end-label" transform="translate(' + labelLeft.toFixed(1) + ',' + (L.y - 12).toFixed(1) + ')">'
+          + '<rect x="0" y="-12" rx="4" width="178" height="34" fill="#ffffff" fill-opacity="0.96" '
+          + 'stroke="' + L.color + '" stroke-opacity="0.55"/>'
           + '<text x="8" y="2" font-size="11.5" font-weight="700" fill="' + L.color + '">'
           + L.short + ' 会议</text>'
           + '<text x="8" y="18" font-size="11" fill="#374151">'
@@ -764,8 +983,8 @@ tr:last-child td{{border-bottom:none}}
       }}
 
       // 更新滑块旁日期与天数
-      if (startVal) startVal.textContent = fmtDate(allx[startIdx]);
-      if (endVal) endVal.textContent = fmtDate(allx[endIdx]);
+      if (startVal) startVal.textContent = xDate(allx[startIdx]);
+      if (endVal) endVal.textContent = xDate(allx[endIdx]);
       if (countVal) countVal.textContent = filteredN;
     }}
 
@@ -838,6 +1057,8 @@ tr:last-child td{{border-bottom:none}}
       pinned = on;
       tip.classList.toggle('pinned', on);
       svg.classList.toggle('pinned', on);
+      // 固定 / 取消固定会改变浮窗高度策略（阅读模式），需要按新状态重新布局
+      if (tip.style.display === 'block') positionTip();
     }}
     function togglePin(){{
       if (tip.style.display !== 'block') return;   // 没有浮窗可固定
@@ -864,13 +1085,13 @@ tr:last-child td{{border-bottom:none}}
       cross.setAttribute('x1', xp); cross.setAttribute('x2', xp);
       cross.style.display = '';
       var snap = allx[i];
-      var parts = ['<div class="tip-date">📅 ' + snap.substring(0, 16) + '</div>'];
+      var parts = ['<div class="tip-date">📅 ' + xTip(snap) + '</div>'];
       var any = false;
       series.forEach(function(s){{
         if (!active[s.md]) return;
         var pt = s.pointsByX[snap];
         if (!pt) return;
-        var bps = bpsLabel(pt.rng);
+        var bps = bpsLabel(pt.rng, baseLo);
         parts.push(
           '<div class="tip-row">'
           + '<div class="tip-row-top">'
@@ -898,15 +1119,26 @@ tr:last-child td{{border-bottom:none}}
           var evColor = DIR_COLOR[ev.direction] || '#fb923c';
           var arrowI = DIR_ICON[ev.direction] || '🔘';
           var evLab = DIR_LABEL[ev.direction] || '事件';
+          // 来源可挂多条：events.csv 的 url 字段用 | 分隔；单条时保持原「查看来源」文案
+          var srcUrls = (ev.url || '').split('|').map(function(s) {{ return s.trim(); }})
+                          .filter(function(s) {{ return s.length > 0; }});
+          var srcHtml = srcUrls.map(function(u, i) {{
+            var lab = srcUrls.length > 1 ? '🔗 来源' + (i + 1) : '🔗 查看来源';
+            return '<a class="tip-src" href="' + escHtml(u)
+                 + '" target="_blank" rel="noopener">' + lab + '</a>';
+          }}).join(' ');
           parts.push(
             '<div class="tip-event">'
-            // 「查看来源」直接跟在事件标题后面：即使正文很长需要滚动，链接也始终可见可点
+            // 来源链接直接跟在事件标题后面：即使正文很长需要滚动，链接也始终可见可点
             + '<div class="tip-event-head" style="color:' + evColor + '">' + arrowI + ' '
             + escHtml(evLab) + '：' + escHtml(ev.summary || '')
-            + (ev.url ? ' <a class="tip-src" href="' + escHtml(ev.url)
-                + '" target="_blank" rel="noopener">🔗 查看来源</a>' : '')
+            + (srcHtml ? ' ' + srcHtml : '')
             + '</div>'
-            + (ev.text ? '<div class="tip-event-body">' + escHtml(ev.text) + '</div>' : '')
+            // 正文里的换行转 <br>：先 escHtml 再替换，不引入注入面
+            // 注意：本段位于 Python 模板字符串内，正则里的换行必须写成 \\n，
+            // 否则会被 Python 先解释成真实换行，生成页出现跨行正则（SyntaxError）。
+            + (ev.text ? '<div class="tip-event-body">'
+                + escHtml(ev.text).split('\\n').join('<br>') + '</div>' : '')
             + '</div>'
           );
         }});
@@ -919,21 +1151,31 @@ tr:last-child td{{border-bottom:none}}
       positionTip();
     }});
 
-    // 浮窗停靠在绘图区右侧留白（pad_r 区）里 —— 与折线图零重叠，不可能盖住任何数据点。
-    // 位置完全由图表几何决定、与鼠标坐标无关 ⇒ 鼠标怎么移动浮窗都纹丝不动，
-    // 可以直接把鼠标移到「查看来源」上点击，不存在追逐问题。
+    // 浮窗锚定在绘图区右下角内侧 —— 位置完全由图表几何决定、与鼠标坐标无关 ⇒
+    // 鼠标怎么移动浮窗都纹丝不动，可以直接把鼠标移到「查看来源」上点击，不存在追逐问题。
+    // 2026-09-29：pad_r 收窄到 12、绘图区铺满卡片后，右侧不再有停靠带；
+    // 浮窗改为覆盖在图上（选右下角：近期读数集中在 40–75% 带，图的下右角数据最少）。
     function positionTip(){{
       var hr = container.getBoundingClientRect();
       var sr = svg.getBoundingClientRect();
       var svgLeft = sr.left - hr.left, svgTop = sr.top - hr.top;
       var scale = sr.width / VBW;
-      var dockLeft = svgLeft + (pad_l + pw) * scale + 10;   // 紧贴绘图区右边界之外
-      var dockW = svgLeft + sr.width - dockLeft - 4;        // 到 SVG 右边界为止
-      tip.style.width = Math.max(150, Math.round(dockW)) + 'px';
-      // 高度与竖直位置对齐绘图区上下沿，视觉上就像图表的侧栏
-      tip.style.maxHeight = Math.round(ph * scale) + 'px';
-      tip.style.left = Math.round(dockLeft) + 'px';
-      tip.style.top = Math.round(svgTop + pad_t * scale) + 'px';
+      var tipW = Math.min(300, Math.round(hr.width * 0.82));
+      tip.style.width = tipW + 'px';
+      // 右缘对齐绘图区右缘内缩 6px；底缘对齐绘图区下缘内缩 6px。
+      // 用 bottom 定位：固定态长文向上生长，不会掉出绘图区下沿。
+      var plotBottomCss = svgTop + (pad_t + ph) * scale;
+      tip.style.left = Math.round(svgLeft + (pad_l + pw) * scale - tipW - 6 * scale) + 'px';
+      tip.style.top = 'auto';
+      tip.style.bottom = Math.round(hr.height - plotBottomCss + 6 * scale) + 'px';
+      // 悬停态限高在绘图区内；固定态进入阅读模式，放宽高度以便读完归因正文
+      var hovH = Math.round(ph * scale - 12);
+      if (pinned) {{
+        tip.style.maxHeight = Math.round(Math.max(hovH,
+          Math.min(hr.height * 0.82, 660))) + 'px';
+      }} else {{
+        tip.style.maxHeight = hovH + 'px';
+      }}
     }}
 
     // 状态机 + 400ms 延迟 + 隐藏前兜底校验

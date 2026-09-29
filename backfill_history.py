@@ -30,6 +30,13 @@ import sys
 import time
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from rate_baseline import (  # noqa: E402
+    derive_target_eras,
+    discover_range_columns,
+    era_target_for,
+)
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -58,9 +65,6 @@ RANGES = [
     "325-350", "350-375", "375-400", "400-425",
     "425-450", "450-475", "475-500",
 ]
-CUR_TARGET_LO = 350
-CUR_TARGET_HI = 375
-CURRENT_TARGET = f"{CUR_TARGET_LO}-{CUR_TARGET_HI}"
 
 # 与现有 daily CSV 一致
 CSV_FIELDS = ["snapshot_cn", "snapshot_quikstrike",
@@ -303,7 +307,8 @@ def main():
                 "snapshot_cn": snapshot_cn,
                 "snapshot_quikstrike": snapshot_quikstrike,
                 "meeting_date": m["md"],
-                "current_target": CURRENT_TARGET,
+                # 占位：落盘前按该行日期所处的「目标区间时代」回填（见下方推导）
+                "current_target": "",
                 "agg_p_hike_pct": "",
                 "agg_p_hold_pct": "",
                 "agg_p_cut_pct": "",
@@ -332,6 +337,23 @@ def main():
         with open(CSV_PATH, "w", encoding="utf-8", newline="") as f:
             w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
             w.writeheader()
+
+    # current_target 按每行日期所处的「目标区间时代」回填：
+    # 旧版写死 350-375，9/16 加息后落盘的就是过期基准（推导规则见 rate_baseline.py）
+    if new_rows:
+        with open(CSV_PATH, encoding="utf-8") as f:
+            hist_rows = list(csv.DictReader(f))
+        merged = hist_rows + new_rows
+        range_cols = discover_range_columns(merged)
+        latest_day = max((r["snapshot_cn"][:10] for r in merged), default="")
+        eras = derive_target_eras(merged, range_cols, latest_day)
+        fallback = next(((r.get("current_target") or "").strip()
+                         for r in reversed(hist_rows)
+                         if (r.get("current_target") or "").strip()), "350-375")
+        for r in new_rows:
+            r["current_target"] = era_target_for(r["snapshot_cn"][:10], eras, fallback)
+        if eras:
+            print("  目标区间时代:", "; ".join(f"{d} → {b}" for d, b in eras))
 
     added = 0
     with open(CSV_PATH, "a", encoding="utf-8", newline="") as f:

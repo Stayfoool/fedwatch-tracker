@@ -8,9 +8,29 @@ fetch_quikstrike.py — 用浏览器自动化从 CME QuikStrike FedWatch 工具
   - 底层 JSON 接口不公开（动态 ScriptResource.axd 加密）
   - QuikStrike 拒访 referer 非 cmegroup.com 的请求；agent-browser 用 --headers 解决
 
+时间口径（详见 time_axis.py 文档头）：
+  一个点 = 美东一个交易日的**收盘定格**。因此本脚本只在
+  `COLLECT_WINDOW = [16:02, 16:58) CT`（CME 收盘后的休市间隙）内采集；
+  不在窗内 → 不启动浏览器、不落盘，直接退出（exit 10）。
+  横轴用的 `us_trade_date` 由采集时刻换算到 CT 推出，**不依赖页面文案格式**。
+
+页面自带的 `Data as of ... CT` 戳：
+  它只在**默认视图**里；一旦切到 Aggregated 视图该节点就消失 —— 必须在点击
+  Aggregated **之前**读取。这正是它长期抓不到（5 条实时记录全为空）的原因。
+  抓到的值写入 `data_asof_ct`：用于新鲜度校验（滞后 > 75 分钟告警）与 tooltip 展示；
+  抓不到只是降级告警，不阻断采集。
+
 输出：
-  data/fedwatch_probabilities.csv — 长表，按 (snapshot_cn, meeting_date) 去重
-  data/snapshots/YYYY-MM-DD.json — 每日完整快照（含所有会议 + ZQ 价格）
+  data/fedwatch_probabilities.csv — 长表，按 (snapshot_cn, meeting_date) 去重，
+      另含三个时间轴派生列：us_trade_date / data_asof_ct / time_basis
+  data/snapshots/YYYY-MM-DD.json — 每日完整快照（含所有会议 + ZQ 价格 + 多个时钟）
+
+退出码：
+  0  抓到新数据并落盘
+  10 不在采集窗口（正常空转；外层视为「无新数据」）
+  11 该美东交易日已有记录（A 方案：保留最早那一次）
+  12 数据与上一快照完全一致（防抖，未写入）
+  3  失败（外层应重试）
 
 依赖：agent-browser CLI 已在 PATH 中、Chromium 已 install。
 """
@@ -20,11 +40,18 @@ import argparse
 import csv
 import datetime as dt
 import json
-import re
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from time_axis import (  # noqa: E402
+    BASIS_PAGE, TIME_AXIS_FIELDS, asof_freshness, asof_is_post_close,
+    collect_window_note, in_collect_window, normalize_asof, now_ct,
+    parse_page_asof, us_trade_date_from_ct,
+)
+from rate_baseline import resolve_current_target  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
@@ -38,9 +65,7 @@ QUIKSTRIKE_URL = (
 CME_REFERER = "https://www.cmegroup.com/markets/interest-rates/cme-fedwatch-tool.html"
 HEADERS_JSON = json.dumps({"Referer": CME_REFERER})
 
-# 当前目标区间（FedWatch Aggregated 列宽）
-CURRENT_TARGET_LO = 350
-CURRENT_TARGET_HI = 375
+# FedWatch Aggregated 列的固定区间宽度（页面表格布局，与目标区间无关）
 RANGES = [
     "325-350", "350-375", "375-400", "400-425",
     "425-450", "450-475", "475-500",
@@ -51,7 +76,7 @@ CSV_FIELDS = ["snapshot_cn", "snapshot_quikstrike",
               "agg_p_hike_pct", "agg_p_hold_pct", "agg_p_cut_pct",
               "max_range_label", "max_range_pct",
               "aggregated_ranges"] + [f"range_{r.replace('-', '_')}_pct"
-                                       for r in RANGES]
+                                       for r in RANGES] + TIME_AXIS_FIELDS
 
 
 def most_likely_range(probs: dict) -> tuple[str, float]:
@@ -138,6 +163,25 @@ CLICK_AGG_JS = r"""
 })()
 """
 
+# 页面自带的数据时点，只在默认视图里存在 —— 必须在点击 Aggregated 之前读。
+ASOF_JS = r"""
+(function(){
+  const out = {raw: '', tag: '', mode: ''};
+  for (const el of document.querySelectorAll('td,th,div,span,p')) {
+    if (el.children.length) continue;
+    const t = (el.textContent || '').trim();
+    if (/data as of/i.test(t) && t.length < 120) {
+      out.raw = t; out.tag = el.tagName; out.mode = 'dom'; break;
+    }
+  }
+  if (!out.raw) {
+    const m = document.body.innerText.match(/data as of[^\n]*/i);
+    if (m) { out.raw = m[0].trim(); out.mode = 'innerText'; }
+  }
+  return out;
+})()
+"""
+
 EXTRACT_JS = r"""
 (function(){
   const out = {meetings: [], zq_prices: [], snapshot_quikstrike: ''};
@@ -180,6 +224,23 @@ EXTRACT_JS = r"""
 """
 
 
+def _b64(s: str) -> str:
+    import base64
+    return base64.b64encode(s.encode()).decode()
+
+
+def read_page_asof() -> str:
+    """在默认视图里读页面的 Data-as-of 戳。失败不抛异常（只是降级）。"""
+    try:
+        resp = ab_json(["eval", "--base64", _b64(ASOF_JS)], timeout=60)
+        res = resp.get("data", {}).get("result", {})
+        if isinstance(res, dict):
+            return str(res.get("raw") or "").strip()
+    except RuntimeError:
+        pass
+    return ""
+
+
 def click_aggregated_tab() -> None:
     """点击 Aggregated tab，返回 result.ok=True 才算成功。"""
     resp = ab_json(["eval", "--base64",
@@ -190,7 +251,7 @@ def click_aggregated_tab() -> None:
 
 
 def extract_data() -> dict:
-    """从当前 DOM 抽取 Aggregated 表 + ZQ 价格 + 时间戳。"""
+    """从当前 DOM 抽取 Aggregated 表 + ZQ 价格。"""
     resp = ab_json(["eval", "--base64",
                     _b64(EXTRACT_JS)], timeout=60)
     res = resp.get("data", {}).get("result", {})
@@ -201,39 +262,51 @@ def extract_data() -> dict:
     return res
 
 
-def _b64(s: str) -> str:
-    import base64
-    return base64.b64encode(s.encode()).decode()
-
-
 # ---------------- 数据加工 ----------------
 
-def to_rows(snapshot: dict, snapshot_cn: str) -> list[dict]:
-    """把 QuikStrike 抽取的快照转成 CSV 行。"""
+def to_rows(snapshot: dict, snapshot_cn: str, us_trade_date: str,
+            asof_raw: str, cur_target: str) -> list[dict]:
+    """把 QuikStrike 抽取的快照转成 CSV 行（含三个时间轴派生列）。
+
+    cur_target 由 resolve_current_target 按「最近已开完的 FOMC 决议」推导，
+    不再写死（2026-09-29 前 CURRENT_TARGET 曾硬编码 350-375，9/16 加息 25bp 后
+    未更新，导致 agg 口径把已兑现加息也计进「加息」；且旧算法 hike=除持稳桶
+    外全部，把降息桶也误计为加息，现一并修正为严格的上下界划分）。
+    """
     rows = []
-    cur_target = f"{CURRENT_TARGET_LO}-{CURRENT_TARGET_HI}"
+    target_lo, target_hi = (int(x) for x in cur_target.split("-"))
     for m in snapshot["meetings"]:
         probs = dict(zip(m["ranges"], m["probabilities"]))
         # 用全部命中区间计算 max（含 0% 的也保留以保持与官网表一致）
         max_label, max_pct = most_likely_range(probs)
         row = {
             "snapshot_cn": snapshot_cn,
-            "snapshot_quikstrike": snapshot.get("snapshot_quikstrike", ""),
+            # 这一列保留页面原文（含 "* Data as of ..."），便于审计
+            "snapshot_quikstrike": asof_raw or snapshot.get("snapshot_quikstrike", ""),
             "meeting_date": m["meeting_date"],
             "current_target": cur_target,
             "aggregated_ranges": json.dumps(
                 {r: probs.get(r, 0.0) for r in m["ranges"]},
                 ensure_ascii=False),
+            "us_trade_date": us_trade_date,
+            # 规范化后的数据时点；解析不出就是空串（明确表示「没有可信时点」）
+            "data_asof_ct": normalize_asof(asof_raw),
+            "time_basis": BASIS_PAGE,
         }
         for r in RANGES:
             row[f"range_{r.replace('-', '_')}_pct"] = f"{probs.get(r, 0.0):.2f}"
-        hold = probs.get(cur_target, 0.0)
-        hike = sum(v for k, v in probs.items() if k != cur_target)
-        cut = 0.0
+        hold = hike = cut = 0.0
         for r, v in probs.items():
-            lo = int(r.split("-")[0])
-            if lo < CURRENT_TARGET_LO:
+            try:
+                lo, hi = (int(x) for x in r.split("-"))
+            except ValueError:
+                continue
+            if lo >= target_hi:
+                hike += v
+            elif hi <= target_lo:
                 cut += v
+            else:
+                hold += v
         row["agg_p_hike_pct"] = f"{hike:.2f}"
         row["agg_p_hold_pct"] = f"{hold:.2f}"
         row["agg_p_cut_pct"] = f"{cut:.2f}"
@@ -247,10 +320,26 @@ def load_existing() -> dict:
     if not CSV_PATH.exists():
         return {}
     out = {}
-    with open(CSV_PATH, encoding="utf-8", newline="") as f:
+    with open(CSV_PATH, encoding="utf-8-sig", newline="") as f:
         for r in csv.DictReader(f):
             key = (r.get("snapshot_cn", ""), r.get("meeting_date", ""))
             out[key] = r
+    return out
+
+
+def recorded_us_days() -> set[str]:
+    """已经用**新口径**记录过的美东交易日（A 方案的去重依据）。
+
+    只统计 time_basis=page_asof 的行。历史那 5 个 legacy_intraday 点是盘中读数，
+    不应挡住同一交易日随后的收盘定格采集 —— 过渡日会出现一次「同日两个点」，
+    那是两个口径的真实读数，不是重复。
+    """
+    out = set()
+    for r in load_existing().values():
+        if (r.get("time_basis") or "").strip() == BASIS_PAGE:
+            d = (r.get("us_trade_date") or "").strip()
+            if d:
+                out.add(d)
     return out
 
 
@@ -266,16 +355,12 @@ def write_csv(rows: list[dict], snapshot_cn: str | None = None) -> int:
     """把本次抓取结果合并到 CSV。
 
     去重逻辑：
-      - snapshot_cn 取到分钟精度（去掉秒），同分钟内重复运行视为同一次
-      - 如果该 snapshot_cn 已经存在且数据一致（aggregated_ranges 一致），
-        跳过；否则覆盖更新该 (snapshot_cn, meeting_date) 行
-      - 如果本次内容与上一个 snapshot_cn 完全一致（防抖），
-        跳过整次写入
+      - snapshot_cn = 北京真实采集时刻（整分钟），同分钟内重复运行视为同一次
+      - 若该 snapshot_cn 已存在，按 (snapshot_cn, meeting_date) 覆盖更新
+      - 防抖：与上一个 snapshot_cn 内容完全一致则整次跳过（返回 0）
+      - 跨交易日的去重（A 方案）由调用方用 recorded_us_days() 提前拦掉
     """
     DATA.mkdir(parents=True, exist_ok=True)
-    # 把秒数归零：同一分钟内所有行用同一戳。snapshot_cn 可由调用方传入
-    # “交易日归档”标签：周末 QuikStrike 仍显示上一个交易日行情，不能把它
-    # 直接写成周六/周日，否则折线图会产生不存在的周末交易日。
     if snapshot_cn is None:
         snapshot_cn = dt.datetime.now().replace(second=0, microsecond=0) \
                                        .strftime("%Y-%m-%d %H:%M:%S")
@@ -284,14 +369,9 @@ def write_csv(rows: list[dict], snapshot_cn: str | None = None) -> int:
 
     # 防抖：与上一个 snapshot_cn 数据一致则整次跳过
     existing = load_existing()
-    prev_by_meet = {}
-    for (sc, md), r in existing.items():
-        if sc != snapshot_cn:
-            prev_by_meet[md] = sc  # 最新一行（按 snapshot_cn 倒序）
-    # 找真正的「上一分钟」的所有行（按 snapshot_cn 排序）
     sorted_snaps = sorted({sc for sc, _ in existing.keys()}, reverse=True)
-    if len(sorted_snaps) >= 1:
-        prev_snap = sorted_snaps[0]  # 最近的（snapshot_cn 倒序第一个就是最新）
+    if sorted_snaps:
+        prev_snap = sorted_snaps[0]
         prev_rows = [r for (sc, _), r in existing.items() if sc == prev_snap]
         if prev_rows and signature(prev_rows) == signature(rows):
             return 0  # 数据未变，跳过整次
@@ -303,109 +383,152 @@ def write_csv(rows: list[dict], snapshot_cn: str | None = None) -> int:
             new_count += 1
         existing[key] = row
     with open(CSV_PATH, "w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        w = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
         w.writeheader()
         for r in sorted(existing.values(),
-                        key=lambda x: (x["snapshot_cn"], x["meeting_date"])):
+                        key=lambda x: (x.get("snapshot_cn", ""),
+                                       x.get("meeting_date", ""))):
             w.writerow(r)
     return new_count
 
 
-def effective_snapshot_dt(captured_at: dt.datetime | None = None) -> dt.datetime:
-    """把周末实时抓取归档到最近一个工作日，保留实际时分秒。
-
-    QuikStrike 在周末通常仍展示上一交易日的收盘/周末前价格。本站的
-    折线按交易日而不是自然日展示，因此周六、周日分别归档到周五。
-    原始抓取时刻仍写入每日 JSON 的 captured_at_cn 供审计。
-    """
-    captured_at = captured_at or dt.datetime.now()
-    if captured_at.weekday() == 5:      # Saturday -> Friday
-        return captured_at - dt.timedelta(days=1)
-    if captured_at.weekday() == 6:      # Sunday -> Friday
-        return captured_at - dt.timedelta(days=2)
-    return captured_at
-
-
-def save_snapshot(snapshot: dict, captured_at_cn: str, effective_snapshot_cn: str) -> Path:
+def save_snapshot(snapshot: dict, snapshot_cn: str, us_trade_date: str,
+                  asof_raw: str, collect_ct: str) -> Path:
+    """落盘每日 JSON，把每个时钟都显式记下来（审计用）。"""
     SNAP_DIR.mkdir(parents=True, exist_ok=True)
     today = dt.datetime.now().strftime("%Y-%m-%d")
     p = SNAP_DIR / f"{today}.json"
-    # Keep the extracted payload intact while recording both clocks explicitly.
     saved = dict(snapshot)
-    saved["captured_at_cn"] = captured_at_cn
-    saved["effective_snapshot_cn"] = effective_snapshot_cn
+    saved["snapshot_cn"] = snapshot_cn                # = 北京采集时刻（整分钟）
+    saved["captured_at_cn"] = snapshot_cn             # 北京真实采集时刻
+    saved["collect_ct"] = collect_ct                  # 采集瞬间的 CT 墙钟
+    saved["effective_snapshot_cn"] = snapshot_cn      # 兼容旧读取方（已废弃）
+    saved["us_trade_date"] = us_trade_date            # 横轴用
+    saved["data_asof_ct"] = normalize_asof(asof_raw)  # 规范化
+    saved["data_asof_raw"] = asof_raw                 # 页面原文（审计用）
     p.write_text(json.dumps(saved, ensure_ascii=False, indent=2))
     return p
 
 
 # ---------------- 主流程 ----------------
 
-def run_once(dry: bool = False) -> dict:
-    """完整跑一次：开浏览器 → 点击 Aggregated → 抓数据 → 落盘。"""
+def run_once(dry: bool = False, force: bool = False) -> dict:
+    """完整跑一次：门禁 → 开浏览器 → 读页面时间戳 → 抓数据 → 落盘。"""
+    captured_at = dt.datetime.now().replace(second=0, microsecond=0)
+    captured_at_cn = captured_at.strftime("%Y-%m-%d %H:%M:%S")
+    # 采集瞬间只取一次 CT 时钟：窗口判定与交易日标签共用同一基准，避免跨分钟漂移
+    collect_ct = now_ct()
+    usd = us_trade_date_from_ct(collect_ct).isoformat()
+
+    # 门禁一：必须在收盘后的休市间隙内（硬保证，不依赖页面文案）
+    if not dry and not force and not in_collect_window(collect_ct):
+        return {"status": "out_of_window", "exit_code": 10,
+                "collect_ct": f"{collect_ct:%Y-%m-%d %H:%M:%S %Z}",
+                "note": collect_window_note(collect_ct),
+                "us_trade_date": usd, "captured_at_cn": captured_at_cn,
+                "n_meetings": 0, "new_count": 0, "data_asof_ct": "",
+                "asof_fresh": False, "asof_note": "未采集"}
+
+    # 门禁二：该美东交易日已有记录 → 跳过，连浏览器都不开（A 方案）
+    if not dry and not force and usd in recorded_us_days():
+        return {"status": "duplicate_day", "exit_code": 11,
+                "collect_ct": f"{collect_ct:%Y-%m-%d %H:%M:%S %Z}",
+                "us_trade_date": usd, "captured_at_cn": captured_at_cn,
+                "note": f"us_trade_date={usd} 已有记录，A 方案保留最早那一次",
+                "n_meetings": 0, "new_count": 0, "data_asof_ct": "",
+                "asof_fresh": False, "asof_note": "未采集"}
+
     ensure_browser_idle()
     final_url = open_quikstrike()
     # 给 ASP.NET 异步加载留时间（含第三方脚本）
     time.sleep(8)
+    asof_raw = read_page_asof()          # 必须在点击 Aggregated 之前读
     click_aggregated_tab()
     time.sleep(5)
     snapshot = extract_data()
-    captured_at = dt.datetime.now().replace(second=0, microsecond=0)
-    effective_at = effective_snapshot_dt(captured_at)
-    captured_at_cn = captured_at.strftime("%Y-%m-%d %H:%M:%S")
-    snapshot_cn_raw = effective_at.strftime("%Y-%m-%d %H:%M:%S")
-    rows = to_rows(snapshot, snapshot_cn_raw)
-    if dry:
-        return {"rows": rows, "snapshot": snapshot,
-                "snapshot_cn": snapshot_cn_raw,
-                "captured_at_cn": captured_at_cn,
-                "final_url": final_url}
-    new_count = write_csv(rows, snapshot_cn_raw)
-    snap_path = save_snapshot(snapshot, captured_at_cn, snapshot_cn_raw)
-    return {
-        "new_count": new_count,
+    asof_ct = parse_page_asof(asof_raw)
+    fresh, fresh_note = asof_freshness(asof_ct, now_ct())
+
+    cur_target = resolve_current_target(load_existing().values(),
+                                        snapshot.get("meetings", []), usd)
+    rows = to_rows(snapshot, captured_at_cn, usd, asof_raw, cur_target)
+    meta = {
         "n_meetings": len(rows),
-        "snapshot_cn": snapshot_cn_raw,
+        "current_target": cur_target,
+        "snapshot_cn": captured_at_cn,
         "captured_at_cn": captured_at_cn,
-        "snapshot_quikstrike": snapshot.get("snapshot_quikstrike", ""),
-        "snapshot_path": str(snap_path),
+        "collect_ct": f"{collect_ct:%Y-%m-%d %H:%M:%S %Z}",
+        "us_trade_date": usd,
+        "data_asof_ct": asof_raw,
+        "asof_fresh": fresh,
+        "asof_note": fresh_note,
+        "asof_post_close": asof_is_post_close(asof_ct),
+        "snapshot_quikstrike": asof_raw,
         "final_url": final_url,
     }
+    if dry:
+        return {**meta, "status": "dry", "rows": rows, "snapshot": snapshot}
+    if not fresh:
+        # 只告警不阻断：收盘口径的保证来自 collect_ct 落在休市间隙
+        meta["warn"] = fresh_note
+    new_count = write_csv(rows, captured_at_cn)
+    snap_path = save_snapshot(snapshot, captured_at_cn, usd, asof_raw,
+                              f"{collect_ct:%Y-%m-%d %H:%M:%S %Z}")
+    meta["new_count"] = new_count
+    meta["snapshot_path"] = str(snap_path)
+    if new_count == 0:
+        meta.update(status="unchanged", exit_code=12,
+                    note="数据与上一快照完全一致（防抖），未写入")
+    else:
+        meta["status"] = "ok"
+    return meta
 
 
 def report(s: dict) -> str:
-    if "rows" in s:
-        return f"[dry] 抽到 {len(s['rows'])} 行；第一行: {s['rows'][0]}"
+    if s.get("status") == "dry":
+        return (f"[dry] 抽到 {len(s['rows'])} 行 / {s['n_meetings']} 个会议；"
+                f"us_trade_date={s['us_trade_date']}；页面戳={s['data_asof_ct']!r}")
     lines = [
-        f"实际采集时间(北京): {s.get('captured_at_cn', s['snapshot_cn'])}",
-        f"交易日归档时间: {s['snapshot_cn']}",
-        f"QuikStrike 时间戳: {s['snapshot_quikstrike'] or '(未抓到)'}",
-        f"新增行数: {s['new_count']} / 总 {s['n_meetings']} 个会议",
-        f"快照文件: {s['snapshot_path']}",
-        "",
-        "关注会议 Aggregated 加息累计概率:",
+        f"状态: {s['status']}",
+        f"采集瞬间(CT): {s['collect_ct']}",
+        f"实际采集时间(北京): {s['captured_at_cn']}",
+        f"us_trade_date（横轴用）: {s['us_trade_date']}",
+        f"页面自带数据时点: {s.get('data_asof_ct') or '(未抓到)'}",
+        f"  新鲜度: {'OK' if s.get('asof_fresh') else '警告'} —— {s.get('asof_note', '')}",
     ]
+    if s.get("n_meetings"):
+        lines.append(f"新增行数: {s.get('new_count', 0)} / 共 {s['n_meetings']} 个会议")
+    if s.get("note"):
+        lines.append(f"说明: {s['note']}")
+    if s.get("snapshot_path"):
+        lines.append(f"快照文件: {s['snapshot_path']}")
+    if s.get("status") != "ok":
+        return "\n".join(lines)
+    lines += ["", "关注会议 Aggregated 加息累计概率:"]
     by_meet = {}
-    with open(CSV_PATH, encoding="utf-8") as f:
+    with open(CSV_PATH, encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
             if r["snapshot_cn"] == s["snapshot_cn"]:
                 by_meet[r["meeting_date"]] = r
-    for m in ("2026-09-16", "2026-10-28"):
-        if m in by_meet:
-            r = by_meet[m]
-            lines.append(
-                f"  {m}: 加息 {r['agg_p_hike_pct']}% / "
-                f"维持 {r['agg_p_hold_pct']}% / 降息 {r['agg_p_cut_pct']}%")
+    for m in sorted(by_meet)[:3]:
+        r = by_meet[m]
+        lines.append(
+            f"  {m}: 加息 {r['agg_p_hike_pct']}% / "
+            f"维持 {r['agg_p_hold_pct']}% / 降息 {r['agg_p_cut_pct']}%")
     return "\n".join(lines)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dry", action="store_true", help="只打印不落盘")
+    ap.add_argument("--dry", action="store_true",
+                    help="只打印不落盘（同时跳过所有门禁，便于随时试跑）")
+    ap.add_argument("--force", action="store_true",
+                    help="跳过窗口门禁与当日去重（仍记录页面数据新鲜度）")
     ap.add_argument("--json", action="store_true", help="以 JSON 输出")
     args = ap.parse_args()
 
     try:
-        s = run_once(dry=args.dry)
+        s = run_once(dry=args.dry, force=args.force)
     except Exception as e:
         print(f"FAILED: {e}", file=sys.stderr)
         return 3
@@ -416,10 +539,10 @@ def main() -> int:
             pass
 
     if args.json:
-        print(json.dumps(s, ensure_ascii=False, indent=2))
+        print(json.dumps(s, ensure_ascii=False, indent=2, default=str))
     else:
         print(report(s))
-    return 0
+    return int(s.get("exit_code", 0))
 
 
 if __name__ == "__main__":

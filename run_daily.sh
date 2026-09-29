@@ -2,8 +2,16 @@
 # run_daily.sh — FedWatch 每日采集、报告生成和生产发布入口（LaunchAgent 调用）
 #
 # 时间线（北京时间）：
-#   10:00 第 1 次尝试；抓取失败则 10:10、10:20 各重试 1 次
-#   抓取成功后重建报告，并把 report/ 自动发布到 Cloudflare Pages production
+#   launchd 挂两个触发器：05:30 与 06:30
+#     夏令时(CDT) → 只有 05:30 那次落在窗口内（= 前一日 16:30 CT）
+#     冬令时(CST) → 只有 06:30 那次落在窗口内（= 前一日 16:30 CT）
+#   窗口 = 美东收盘后的休市间隙 [16:02, 16:58) CT，由 fetch_quikstrike.py 自行判定，
+#   不在窗口内的那次直接跳过（exit 10），不做任何采集。
+#   落在窗口内的那次若失败，则 +10、+20 分钟重试（仍在窗口内）；成功后重建报告并发布。
+#
+# 退出码约定（fetch_quikstrike.py）：
+#   0 成功 / 10 不在采集窗口 / 11 该美东交易日已有收盘读数 / 12 数据未变
+#   10、11、12 都属于「正常跳过」，不重试、不告警。
 #
 # 流程：
 #   1. fetch_quikstrike.py 抓取 QuikStrike Aggregated View
@@ -47,6 +55,11 @@ while [[ $attempt -le $MAX ]]; do
     FETCH_OK=1
     break
   fi
+  # 10/11/12 = 正常跳过（不在窗口 / 重复交易日 / 数据未变）：不重试、不告警
+  if [[ $RC -eq 10 || $RC -eq 11 || $RC -eq 12 ]]; then
+    log "SKIP 本次无需采集 (rc=$RC)，不重试、不发布 $(date '+%F %T %Z')"
+    exit 0
+  fi
   log "--- 抓取失败 (rc=$RC)"
   attempt=$((attempt + 1))
   if [[ $attempt -le $MAX ]]; then
@@ -61,15 +74,31 @@ if [[ $FETCH_OK -ne 1 ]]; then
 fi
 
 log "=== 重建报告 $(date '+%F %T %Z')"
+# 快照选取自检：会议开完后抓取表会少一个会议，选错会展示已结束的会议（详见 snapshot_pick.py）
+if ! "$PY" snapshot_pick.py 2>&1 | tee -a "$LOG"; then
+  log "FAILED 快照选取自检未通过；为避免发布错误数据，本次不部署"
+  exit 1
+fi
 if ! "$PY" build_report.py 2>&1 | tee -a "$LOG"; then
   log "FAILED 报告重建失败；为避免发布旧数据，本次不部署"
   exit 1
 fi
 
+# 「方向与幅度」双图页（report/curves.html）：与主看板同数据源，失败不阻断部署。
+if ! "$PY" build_curves.py 2>&1 | tee -a "$LOG"; then
+  log "--- 双图页 curves.html 生成失败（不阻断部署）"
+fi
+
 # 发现尚未标注原因的 ≥8pp 变动日在日志中提示；失败不阻断报告发布。
+# 口径：焦点会议（最近一场未开完的 FOMC）。退出码 2 = 有未归因日（需补 events.csv），
+# 不是脚本出错；只有 1 才是真异常。
 log "=== 重大变动检测 $(date '+%F %T %Z')"
-if ! "$PY" analyze_changes.py --days 7 2>&1 | tee -a "$LOG"; then
-  log "--- 重大变动检测失败（不阻断部署）"
+"$PY" analyze_changes.py --days 7 2>&1 | tee -a "$LOG"
+AC_RC=${pipestatus[1]}
+if [[ $AC_RC -eq 2 ]]; then
+  log "--- 有变动日尚未归因，请补 data/events.csv（不阻断部署）"
+elif [[ $AC_RC -ne 0 ]]; then
+  log "--- 重大变动检测异常退出 rc=$AC_RC（不阻断部署）"
 fi
 
 deploy_attempt=1

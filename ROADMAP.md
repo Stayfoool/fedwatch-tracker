@@ -11,7 +11,7 @@
 3. 通过清晰的数据来源、方法、项目边界、稳定 URL 和外部引用，逐步成为搜索及 AI 检索回答可引用的可信来源；
 4. 保持每日数据自动更新与现有交互看板功能不受影响。
 
-## 当前状态（2026-09-15）
+## 当前状态（2026-09-17）
 
 - 生产站点：`https://fedwatch-tracker.pages.dev/`
 - 当前已验证 deployment：`be2bb859`，unique URL：`https://be2bb859.fedwatch-tracker.pages.dev/`
@@ -19,11 +19,27 @@
 - 规范域名：目前仍为 `pages.dev`；独立域名尚未购买或绑定。
 - 站点规模：18 个可索引 HTML 页面，另有 robots、sitemap、CSV、OG 图片、favicon、`llms.txt` 和真实 404。
 - 项目身份：页面明确为独立项目、与 CME 和 Federal Reserve 无隶属关系；**维护者姓名、组织、邮箱和联系方式暂不公开**。
-- 外部提交：Google Search Console URL-prefix property 已通过 HTML meta 验证；`sitemap.xml` 已提交，但刚提交时显示 `Couldn't fetch`，待 Google 重试读取；首页 Request Indexing 因当日配额已满，尚未进入提交队列。Bing Webmaster Tools 尚未配置。
+- 外部提交：Google Search Console URL-prefix property 已通过 HTML meta 验证；`sitemap.xml` 已提交，仍需复核状态并重试首页 Request Indexing。Bing Webmaster Tools 尚未完成验证与 sitemap 提交。2026-09-17 再次尝试时，自动化浏览器没有 Google 或 Microsoft 已登录会话；需站点所有者在浏览器完成登录（包括可能的 MFA）后继续。
+
+## 2026-09-17 时间轴改美东交易日（已上线）
+
+- [x] **采集挪到清晨**：LaunchAgent 改为北京 05:30 / 06:30 双触发，由
+      `COLLECT_WINDOW = [16:02, 16:58) CT` 放行正确的那一次（夏令时 05:30、冬令时 06:30，
+      折算到芝加哥都是前一日 16:30 CT）。**北京 06:00 整点两个时制都不成立**，已核实。
+- [x] **横轴改美东交易日**：新增派生列 `us_trade_date` / `data_asof_ct` / `time_basis`，
+      一个点 = 一个美东交易日的收盘定格；`snapshot_cn`（北京采集时刻）保留为排序与关联键不动。
+- [x] **读页面自带时间戳**：`Data as of … CT` 只在默认视图存在、切到 Aggregated 后消失，
+      因此必须在点击 Aggregated **之前**读取；旧代码读不到它的原因就在这里。
+- [x] **周末去重采用 A 方案**：周六/周日/周一早上的三次采集读到同一份周五收盘，
+      按「一个交易日一个点」去重、保留最早一次，每周固定 5 个点。
+- [x] **过渡期处理**：旧的 5 个北京 10:00 盘中点标记为 `legacy_intraday`，
+      不阻挡新口径采集；同一交易日出现两种口径时，收盘定格优先（展示层去重）。
+- [x] CSV 已迁移（2815 行，自动备份），自检通过，站点已重建。
 
 ## 2026-09-15 采集口径确认
 
 - [x] 公开网站不追踪 FedWatch 盘中变动；以北京时间每天 10:00 的成功抓取为准。
+      （**已于 2026-09-17 改为清晨采集口径，见上节**）
 - [x] 10:10、10:20 仅在前一次失败时重试，不构成额外的常规快照。
 - [x] 清理 2026-09-15 诊断期间手动加入的 12:05 快照，线上恢复为 10:00 快照（9/16 加息概率 92.39%）。
 - [ ] 评估是否将周日历史回填从自动主流程改为手动维护；它只补历史日期级数据，不应被理解为盘中更新。
@@ -123,7 +139,7 @@
 
 1. [ ] 2026-09-16 或之后重新检查 Search Console 的 sitemap 状态；若仍为 `Couldn't fetch`，查看详细错误并继续排查 Google 抓取侧问题。
 2. [ ] 2026-09-16 或之后再次对首页执行 Request Indexing；2026-09-15 因 Google 当日配额已满未能提交。
-3. [ ] 使用站点所有者的 Microsoft 账号完成 Bing Webmaster Tools 验证或从 Search Console 导入。
+3. [ ] 使用站点所有者的 Microsoft 账号完成 Bing Webmaster Tools 验证或从 Search Console 导入。2026-09-17 已打开 Bing 账户选择窗口，但当前浏览器没有已登录会话；待所有者完成账户登录/MFA 后，导入 Search Console 属性（优先）或以 sitemap/HTML 验证，并提交 `https://fedwatch-tracker.pages.dev/sitemap.xml`。
 4. [ ] 决定是否购买独立域名；若购买，更新 `FEDWATCH_SITE_URL`、Cloudflare custom domain、301、canonical、sitemap 和两个站长平台属性。
 5. [ ] 在不披露维护者身份的前提下，准备第一批可被外部引用的周报/事件复盘和公开项目页。
 6. [ ] 轮换此前在聊天中暴露过的 Cloudflare API token。

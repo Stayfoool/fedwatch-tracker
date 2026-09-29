@@ -13,7 +13,9 @@
 - 使用已有 Pages 项目 `fedwatch-tracker` 的 Direct Upload / production `main` 分支覆盖。
 - API token 不写入项目、脚本、文档或日志；仅从项目外权限为 `600` 的文件读取。
 - 使用固定版本的官方 Wrangler CLI，避免每日运行时漂移到未经验证的新版本。
-- macOS LaunchAgent 每天北京时间 10:00 调用 `run_daily.sh`；发布失败返回非零并写入日志。
+- macOS LaunchAgent 每天北京时间 **05:30 与 06:30** 各触发一次 `run_daily.sh`
+  （夏令时由 05:30 命中、冬令时由 06:30 命中，折算到芝加哥都是前一日 16:30 CT 的收盘后休市间隙）；
+  不在采集窗口内的那次由 `fetch_quikstrike.py` 以 exit 10 跳过，不重试、不发布；发布失败返回非零并写入日志。
 - `FEDWATCH_SITE_URL` 控制构建时的 canonical 基址；未设置时为 `https://fedwatch-tracker.pages.dev`。
 - 维护者身份、组织、邮箱和联系方式当前不写入页面或结构化数据。
 
@@ -54,7 +56,7 @@ report/
 - [x] 固定兼容现有抓取流程的官方 `agent-browser@0.27.0`
 - [x] 安全部署脚本检查 token 文件类型、所有者和权限
 - [x] `run_daily.sh` 接入 Pages 发布，并对暂时性发布失败重试
-- [x] 安装并加载每日 10:00 的 macOS LaunchAgent
+- [x] 安装并加载 macOS LaunchAgent（每日 05:30 / 06:30 双触发）
 - [x] 从单页看板升级为多页 SEO 静态站点
 - [x] 生成 robots、sitemap、真实 404、canonical、结构化数据和 CSV 下载
 - [x] 构建失败阻止发布旧的或不完整的站点
@@ -74,8 +76,10 @@ report/
 
 ## 已实施流程
 
-1. LaunchAgent 每天本机时间 10:00 调用 `run_daily.sh`。
-2. 抓取最多尝试 3 次，成功后重建完整站点；构建或验证失败不发布。
+1. LaunchAgent 每天本机时间 05:30 与 06:30 各调用一次 `run_daily.sh`；只有落在
+   芝加哥时间 `[16:02, 16:58)` 休市间隙内的那次会真正采集，另一次以 exit 10 跳过。
+2. 抓取最多尝试 3 次（间隔 10 分钟，仍在窗口内），成功后重建完整站点；构建或验证失败不发布。
+   抓取返回 10/11/12（不在窗口 / 该交易日已有收盘读数 / 数据未变）视为正常跳过，不重试也不发布。
 3. 重大变动检测为非阻断步骤。
 4. Pages 发布最多尝试 3 次；每次由固定版本 Wrangler 上传 production `main`。
 5. `deploy_pages.sh` 等待 production alias 传播，然后验证：

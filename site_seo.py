@@ -18,6 +18,8 @@ from pathlib import Path
 from urllib.parse import urljoin
 from xml.etree import ElementTree as ET
 
+from snapshot_pick import pick_latest_snapshot
+
 BASE_DIR = Path(__file__).resolve().parent
 REPORT_DIR = BASE_DIR / "report"
 STATIC_DIR = BASE_DIR / "static"
@@ -159,8 +161,32 @@ def latest_rows(rows: list[dict]) -> tuple[str, list[dict]]:
     for row in rows:
         if row.get("snapshot_cn"):
             by_snapshot[row["snapshot_cn"]].append(row)
-    latest_key = max(by_snapshot, key=lambda s: (len(by_snapshot[s]), s))
+    latest_key = pick_latest_snapshot(by_snapshot)
     return latest_key, sorted(by_snapshot[latest_key], key=lambda r: r.get("meeting_date", ""))
+
+
+def page_meetings(rows: list[dict], latest: list[dict]) -> dict[str, dict]:
+    """需要独立页面的会议 → 该会议的「最新一条记录」。
+
+    以最新快照中的会议为主；同时保留所有仍有有效历史的会议。FedWatch 会在会议
+    开完后把该会议从抓取表里删掉，若只按最新快照生成页面，已上线并被索引的
+    ``/meetings/<date>/`` 会在会议结束当天变成 404——而站点明确承诺「每个会议拥有
+    独立、稳定的历史页面」，因此这里把刚结束的会议继续归档。
+    """
+    last_row: dict[str, dict] = {}
+    for row in rows:
+        meeting = (row.get("meeting_date") or "").strip()
+        if not meeting:
+            continue
+        prev = last_row.get(meeting)
+        if prev is None or (row.get("snapshot_cn") or "") >= (prev.get("snapshot_cn") or ""):
+            last_row[meeting] = row
+
+    pages = {row["meeting_date"]: row for row in latest}
+    for meeting, row in last_row.items():
+        if meeting not in pages and valid_rows_for_meeting(rows, meeting):
+            pages[meeting] = row
+    return pages
 
 
 def delta(points: list[dict], periods: int) -> float | None:
@@ -173,8 +199,25 @@ def delta_text(value: float | None) -> str:
     return "—" if value is None else f"{value:+.2f} pp"
 
 
+def us_day_map(rows: list[dict]) -> dict[str, str]:
+    """{snapshot_cn: 该快照对应的美东交易日}。
+
+    站点上任何「显示给读者看的日期」都必须走这里，而不是 `snapshot_cn[:10]`
+    （那是北京采集时刻）。口径见 time_axis.py。
+    """
+    out: dict[str, str] = {}
+    for r in rows:
+        key = (r.get("snapshot_cn") or "").strip()
+        if key and key not in out:
+            out[key] = (r.get("us_trade_date") or "").strip() or key[:10]
+    return out
+
+
 def build_homepage_meta(home_html: str, rows: list[dict], latest_key: str, latest: list[dict]) -> str:
-    first_date = min(r["snapshot_cn"][:10] for r in rows if r.get("snapshot_cn"))
+    usd = us_day_map(rows)
+    latest_day = usd.get(latest_key, latest_key[:10])
+    first_date = min(usd.values()) if usd else latest_day
+    coverage_last = max(usd.values()) if usd else latest_day
     description = "每日追踪 CME FedWatch 美联储加息、维持与降息概率，提供未来 FOMC 会议概率、过去一年历史变化、重大事件归因及 CSV 数据下载。"
     schema = [
         {
@@ -186,8 +229,8 @@ def build_homepage_meta(home_html: str, rows: list[dict], latest_key: str, lates
             "@context": "https://schema.org", "@type": "Dataset",
             "name": "FedWatch Tracker Historical FOMC Rate Probabilities",
             "description": "Daily snapshots and historical target-rate probability distributions for upcoming FOMC meetings, derived from CME QuikStrike FedWatch Aggregated View and historical downloads.",
-            "url": canonical("/data/"), "dateModified": latest_key[:10],
-            "temporalCoverage": f"{first_date}/{latest_key[:10]}",
+            "url": canonical("/data/"), "dateModified": coverage_last,
+            "temporalCoverage": f"{first_date}/{coverage_last}",
             "inLanguage": ["zh-CN", "en"], "isBasedOn": CME_URL,
             "distribution": [{"@type": "DataDownload", "encodingFormat": "text/csv", "contentUrl": canonical("/data/fedwatch-probabilities.csv")}],
         },
@@ -203,7 +246,7 @@ def build_homepage_meta(home_html: str, rows: list[dict], latest_key: str, lates
     nearest = latest[0] if latest else {}
     summary = (
         f'<div class="search-summary"><strong>最新 FedWatch 概率快照：</strong>截至 '
-        f'<time datetime="{esc(latest_key.replace(" ", "T"))}">{esc(latest_key)} 北京时间</time>，'
+        f'<time datetime="{esc(latest_day)}">{esc(latest_day)}</time>（美东交易日，收盘后读数），'
         f'下一次 FOMC 会议（{esc(nearest.get("meeting_date", "—"))}）累计加息、维持、降息概率分别为 '
         f'<strong>{pct(nearest.get("agg_p_hike_pct"))}</strong>、<strong>{pct(nearest.get("agg_p_hold_pct"))}</strong>、'
         f'<strong>{pct(nearest.get("agg_p_cut_pct"))}</strong>。本站是每日定时快照，并非 CME 盘中实时行情。</div>'
@@ -211,8 +254,13 @@ def build_homepage_meta(home_html: str, rows: list[dict], latest_key: str, lates
         '<a href="/history/">FOMC 会议概率历史</a><a href="/analysis/">概率变化与事件分析</a><a href="/data/">CSV 数据下载</a>'
         '<a href="/methodology/">数据来源与方法</a><a href="/about/">独立项目说明</a><a href="/en/">English summary</a></div>'
     )
-    needle = f'<div class="sub">数据来源 CME QuikStrike FedWatch 工具（Aggregated View） · 最近快照 {latest_key}（北京时间；官网盘中实时值会随期货价格变动）</div>'
-    home_html = home_html.replace(needle, needle + "\n" + summary, 1)
+    # 按前缀定位插入点：首页副标题的文案会随口径调整，写死整行会在改文案时静默失效
+    needle_prefix = '<div class="sub">数据来源 CME QuikStrike FedWatch 工具'
+    at = home_html.find(needle_prefix)
+    if at >= 0:
+        end = home_html.find("</div>", at)
+        home_html = home_html[:end + len("</div>")] \
+            + "\n" + summary + home_html[end + len("</div>"):]
     meeting_links = "".join(f'<a href="/meetings/{esc(r["meeting_date"])}/">{esc(r["meeting_date"])} 会议历史</a>' for r in latest)
     footer = f"""<footer class="seo-footer"><strong>{SITE_NAME}</strong> 是独立研究与数据追踪项目，不隶属于 CME Group 或美联储。本站不披露项目维护者个人信息。<br>
 <a href="/history/">会议历史</a> · <a href="/analysis/">变化分析</a> · <a href="/data/">数据下载</a> · <a href="/methodology/">方法与来源</a> · <a href="/about/">关于本站</a> · <a href="/en/">English</a><br>{meeting_links}</footer>"""
@@ -220,12 +268,18 @@ def build_homepage_meta(home_html: str, rows: list[dict], latest_key: str, lates
     return home_html
 
 
-def meeting_page(rows: list[dict], meeting: str, latest_key: str, latest_by_meeting: dict[str, dict]) -> str:
+def meeting_page(rows: list[dict], meeting: str, latest_key: str, meeting_records: dict[str, dict]) -> str:
+    usd = us_day_map(rows)
+    latest_us_day = max(usd.values()) if usd else latest_key[:10]
     points = valid_rows_for_meeting(rows, meeting)
-    latest = latest_by_meeting[meeting]
-    first = points[0]["snapshot_cn"][:10] if points else "—"
+    latest = meeting_records[meeting]
+    # 已结束的会议用「它最后一次出现在抓取表里的快照」，而不是最新快照
+    record_key = (latest.get("snapshot_cn") or latest_key).strip() or latest_key
+    record_day = usd.get(record_key, record_key[:10])
+    concluded = meeting < latest_us_day
+    first = usd.get(points[0]["snapshot_cn"], points[0]["snapshot_cn"][:10]) if points else "—"
     d1, d5 = delta(points, 1), delta(points, 5)
-    description = f"{meeting} FOMC 会议的 FedWatch 加息、维持、降息概率与历史最大概率利率区间，更新于 {latest_key} 北京时间。"
+    description = f"{meeting} FOMC 会议的 FedWatch 加息、维持、降息概率与历史最大概率利率区间，更新于 {record_day}（美东交易日）。"
     title = f"{meeting} FOMC 概率历史：加息/维持/降息 | FedWatch Tracker"
     distribution = {}
     try:
@@ -237,28 +291,38 @@ def meeting_page(rows: list[dict], meeting: str, latest_key: str, latest_by_meet
         for label, value in sorted(distribution.items(), key=lambda x: int(x[0].split("-")[0]))
     )
     history_rows = "".join(
-        f'<tr><td><time datetime="{esc(r["snapshot_cn"].replace(" ", "T"))}">{esc(r["snapshot_cn"][:16])}</time></td>'
+        f'<tr><td><time datetime="{esc(usd.get(r["snapshot_cn"], r["snapshot_cn"][:10]))}">'
+        f'{esc(usd.get(r["snapshot_cn"], r["snapshot_cn"][:10]))}</time></td>'
         f'<td>{range_pct(r["max_range_label"])}</td><td class="num">{pct(r["max_range_pct"])}</td></tr>'
         for r in reversed(points)
     )
+    concl_row = (
+        f'<div class="notice">该会议已于 {meeting} 结束，本页作为历史档案保留，'
+        f'数值为会议结束前最后一次采集快照（美东 {record_day}）。'
+        f'查看当前市场预期请回到<a href="/">首页</a>或<a href="/history/">会议历史</a>。</div>\n'
+        if concluded else ""
+    )
     body = f"""<div class="breadcrumbs"><a href="/">首页</a> / <a href="/history/">会议历史</a> / {meeting}</div>
-<h1>{meeting} FOMC 会议概率历史</h1><p class="lede">追踪市场对 {meeting} FOMC 会议后目标利率区间的概率分布。页面同时提供最新累计加息、维持、降息概率，以及过去一年的最大概率区间历史。</p>
-<div class="meta">最新快照：<time datetime="{esc(latest_key.replace(' ', 'T'))}">{esc(latest_key)} 北京时间</time> · 首个有效历史点：{first} · 有效历史点：{len(points)}</div>
+<h1>{meeting} FOMC 会议概率历史</h1><p class="lede">追踪市场对 {meeting} FOMC 会议后目标利率区间的概率分布。页面同时提供{'结束前最后一次' if concluded else '最新'}累计加息、维持、降息概率，以及过去一年的最大概率区间历史。</p>
+{concl_row}<div class="meta">最新数据点：<time datetime="{esc(record_day)}">{esc(record_day)}</time>（美东交易日） · 首个有效历史点：{first} · 有效历史点：{len(points)}</div>
 <div class="grid"><div class="card metric"><span>累计加息概率</span><strong>{pct(latest.get('agg_p_hike_pct'))}</strong></div><div class="card metric"><span>累计维持概率</span><strong>{pct(latest.get('agg_p_hold_pct'))}</strong></div><div class="card metric"><span>累计降息概率</span><strong>{pct(latest.get('agg_p_cut_pct'))}</strong></div></div>
 <div class="notice">最新最大概率目标区间为 <strong>{range_pct(latest.get('max_range_label',''))}</strong>，概率 <strong>{pct(latest.get('max_range_pct'))}</strong>；较上一有效交易日变化 <strong>{delta_text(d1)}</strong>，较 5 个有效交易日前变化 <strong>{delta_text(d5)}</strong>。</div>
 <h2>最新目标利率区间概率分布</h2><div class="table-wrap"><table><thead><tr><th>目标利率区间</th><th class="num">概率</th></tr></thead><tbody>{dist_rows}</tbody></table></div>
-<h2>最大概率区间历史</h2><p class="small">“最大概率区间”是每个快照中概率最高的一档目标利率区间。区间标签切换时，数值序列会直接连接到新的最高概率档。</p><div class="table-wrap"><table><thead><tr><th>快照时间（北京）</th><th>最大概率区间</th><th class="num">该区间概率</th></tr></thead><tbody>{history_rows}</tbody></table></div>
-<h2>来源与口径</h2><p>数据来自 <a href="{CME_URL}" rel="nofollow">CME FedWatch Tool / QuikStrike Aggregated View 与 Historical Downloads</a>。本站按北京时间每日定时采集，属于快照，不保证与稍后打开的盘中实时值相同。详细说明见<a href="/methodology/">方法页</a>，完整 CSV 见<a href="/data/">数据下载页</a>。</p>"""
+<h2>最大概率区间历史</h2><p class="small">“最大概率区间”是每个快照中概率最高的一档目标利率区间，日期为对应的<b>美东交易日</b>。区间标签切换时，数值序列会直接连接到新的最高概率档。</p><div class="table-wrap"><table><thead><tr><th>美东交易日</th><th>最大概率区间</th><th class="num">该区间概率</th></tr></thead><tbody>{history_rows}</tbody></table></div>
+<h2>来源与口径</h2><p>数据来自 <a href="{CME_URL}" rel="nofollow">CME FedWatch Tool / QuikStrike Aggregated View 与 Historical Downloads</a>。本站每个美东交易日在收盘后的休市间隙采集一次（北京时间次日 05:30 / 06:30），一个点 = 该交易日的收盘定格，不保证与稍后打开的盘中实时值相同。详细说明见<a href="/methodology/">方法页</a>，完整 CSV 见<a href="/data/">数据下载页</a>。</p>"""
     schema = {
         "@context": "https://schema.org", "@type": "Dataset", "name": f"{meeting} FOMC FedWatch Probability History",
-        "description": description, "url": canonical(f"/meetings/{meeting}/"), "dateModified": latest_key[:10],
-        "temporalCoverage": f"{first}/{latest_key[:10]}", "isBasedOn": CME_URL,
+        "description": description, "url": canonical(f"/meetings/{meeting}/"), "dateModified": record_day,
+        "temporalCoverage": f"{first}/{record_day}", "isBasedOn": CME_URL,
         "distribution": [{"@type": "DataDownload", "encodingFormat": "text/csv", "contentUrl": canonical(f"/data/meetings/{meeting}.csv")}],
     }
     return page_document(title=title, description=description, path=f"/meetings/{meeting}/", body=body, schema=schema)
 
 
-def history_page(rows: list[dict], latest_key: str, latest: list[dict]) -> str:
+def history_page(rows: list[dict], latest_key: str, latest: list[dict],
+                 archived: dict[str, dict] | None = None) -> str:
+    usd = us_day_map(rows)
+    first_day = lambda p: (usd.get(p[0]["snapshot_cn"], p[0]["snapshot_cn"][:10]) if p else "—")  # noqa: E731
     rows_html = []
     for item in latest:
         meeting = item["meeting_date"]
@@ -266,14 +330,29 @@ def history_page(rows: list[dict], latest_key: str, latest: list[dict]) -> str:
         rows_html.append(
             f'<tr><td><a href="/meetings/{meeting}/">{meeting}</a></td><td>{range_pct(item.get("max_range_label",""))}</td>'
             f'<td class="num">{pct(item.get("max_range_pct"))}</td><td class="num">{pct(item.get("agg_p_hike_pct"))}</td>'
-            f'<td class="num">{delta_text(delta(points,1))}</td><td>{points[0]["snapshot_cn"][:10] if points else "—"}</td><td class="num">{len(points)}</td></tr>'
+            f'<td class="num">{delta_text(delta(points,1))}</td><td>{first_day(points)}</td><td class="num">{len(points)}</td></tr>'
+        )
+    archived_html = []
+    for meeting in sorted(archived or {}):
+        points = valid_rows_for_meeting(rows, meeting)
+        archived_html.append(
+            f'<tr><td><a href="/meetings/{meeting}/">{meeting}</a></td>'
+            f'<td>{usd.get(points[-1]["snapshot_cn"], points[-1]["snapshot_cn"][:10]) if points else "—"}</td>'
+            f'<td class="num">{len(points)}</td></tr>'
         )
     title = "FOMC 会议 FedWatch 概率历史索引 | FedWatch Tracker"
     description = "按未来 FOMC 会议浏览 FedWatch 加息、维持、降息概率和最大概率目标利率区间的历史变化。"
+    archived_block = (
+        '<h2>已结束会议（历史档案）</h2>'
+        '<div class="table-wrap"><table><thead><tr><th>会议日期</th><th>最后采集日</th>'
+        f'<th class="num">历史点数</th></tr></thead><tbody>{"".join(archived_html)}</tbody></table></div>'
+        if archived_html else ""
+    )
     body = f"""<div class="breadcrumbs"><a href="/">首页</a> / 会议历史</div><h1>FOMC 会议概率历史</h1>
-<p class="lede">每个会议拥有独立、稳定的历史页面，便于搜索、引用和比较市场对不同 FOMC 决议日的利率预期。</p><div class="meta">最近更新：<time datetime="{esc(latest_key.replace(' ','T'))}">{esc(latest_key)} 北京时间</time></div>
+<p class="lede">每个会议拥有独立、稳定的历史页面，便于搜索、引用和比较市场对不同 FOMC 决议日的利率预期。</p><div class="meta">最近更新：<time datetime="{esc(usd.get(latest_key, latest_key[:10]))}">{esc(usd.get(latest_key, latest_key[:10]))}</time>（美东交易日）</div>
 <div class="table-wrap"><table><thead><tr><th>会议日期</th><th>最新最大概率区间</th><th class="num">区间概率</th><th class="num">累计加息</th><th class="num">日变化</th><th>首个有效点</th><th class="num">历史点数</th></tr></thead><tbody>{''.join(rows_html)}</tbody></table></div>
-<p class="small">累计加息/维持/降息只展示最新实时快照；历史下载数据主要提供各绝对利率区间的概率，因此会议页的历史表追踪“最大概率区间”。</p>"""
+<p class="small">累计加息/维持/降息只展示最新实时快照；历史下载数据主要提供各绝对利率区间的概率，因此会议页的历史表追踪“最大概率区间”。</p>
+{archived_block}"""
     return page_document(title=title, description=description, path="/history/", body=body)
 
 
@@ -285,17 +364,29 @@ def analysis_page(rows: list[dict], latest_key: str) -> str:
         with events_path.open(encoding="utf-8-sig", newline="") as f:
             events = [r for r in csv.DictReader(f) if (r.get("snapshot_cn") or "").strip()]
     events.sort(key=lambda r: r.get("snapshot_cn", ""), reverse=True)
+    usd = us_day_map(rows)
+    usd_state_day = usd.get(latest_key, latest_key[:10])
     rows_html = []
     for event in events:
         snap = (event.get("snapshot_cn") or "").strip()
-        day = snap[:10]
+        day = usd.get(snap, snap[:10])
         direction = (event.get("direction") or "").strip()
         direction_label = "最大概率区间上升" if direction == "hawk" else "最大概率区间下降" if direction == "dove" else "方向未标记"
         status = "待核实" if "待核实" in (event.get("summary", "") + event.get("text", "")) else "已记录"
         source = (event.get("url") or "").strip()
-        source_link = f'<a href="{esc(source)}" rel="nofollow noopener">来源</a>' if source.startswith("http") else "—"
+        # url 字段可挂多条来源（| 分隔）；单条保持原「来源」文案，多条编号区分
+        sources = [u.strip() for u in source.split("|") if u.strip().startswith("http")]
+        if len(sources) == 1:
+            source_link = f'<a href="{esc(sources[0])}" rel="nofollow noopener">来源</a>'
+        elif sources:
+            source_link = " ".join(
+                f'<a href="{esc(u)}" rel="nofollow noopener">来源{i + 1}</a>'
+                for i, u in enumerate(sources)
+            )
+        else:
+            source_link = "—"
         rows_html.append(
-            f'<tr><td><time datetime="{esc(snap.replace(" ", "T"))}">{esc(day)}</time></td>'
+            f'<tr><td><time datetime="{esc(day)}">{esc(day)}</time></td>'
             f'<td>{esc(direction_label)}</td><td>{esc(event.get("summary") or "—")}</td>'
             f'<td>{esc(status)}</td><td>{source_link}</td></tr>'
         )
@@ -304,39 +395,47 @@ def analysis_page(rows: list[dict], latest_key: str) -> str:
     body = f"""<div class="breadcrumbs"><a href="/">首页</a> / 变化分析</div><h1>FedWatch 概率变化与事件分析</h1>
 <p class="lede">本页记录历史快照中较显著的概率变化，以及同一时间窗口内可核对的事件线索，帮助读者理解市场预期如何变化。</p>
 <div class="notice"><strong>阅读口径：</strong>“上升/下降”指当日变化最大的目标利率区间概率变化，不等同于累计加息概率或新闻的宏观鹰派/鸽派判断。事件归因是叙事归档，不是因果模型；标为“待核实”的记录不应被视为已确认因果。</div>
-<div class="meta">记录数：{len(events)} · 页面最近更新：<time datetime="{esc(latest_key.replace(" ", "T"))}">{esc(latest_key)} 北京时间</time></div>
-<div class="table-wrap"><table><thead><tr><th>快照日期</th><th>区间方向</th><th>事件摘要</th><th>状态</th><th>来源</th></tr></thead><tbody>{''.join(rows_html)}</tbody></table></div>
-<h2>数据与方法</h2><p>概率快照来自 <a href="{CME_URL}" rel="nofollow">CME FedWatch / QuikStrike</a>，本站按北京时间定时保存。完整字段和下载文件见<a href="/data/">数据下载页</a>，归因口径和限制见<a href="/methodology/">方法页</a>。每个日期仍可从<a href="/history/">会议历史</a>进入具体会议页面。</p>"""
+<div class="meta">记录数：{len(events)} · 页面最近更新：<time datetime="{esc(usd.get(latest_key, latest_key[:10]))}">{esc(usd.get(latest_key, latest_key[:10]))}</time>（美东交易日）</div>
+<div class="table-wrap"><table><thead><tr><th>美东交易日</th><th>区间方向</th><th>事件摘要</th><th>状态</th><th>来源</th></tr></thead><tbody>{''.join(rows_html)}</tbody></table></div>
+<h2>数据与方法</h2><p>概率快照来自 <a href="{CME_URL}" rel="nofollow">CME FedWatch / QuikStrike</a>，本站按美东交易日在收盘后定时保存。完整字段和下载文件见<a href="/data/">数据下载页</a>，归因口径和限制见<a href="/methodology/">方法页</a>。每个日期仍可从<a href="/history/">会议历史</a>进入具体会议页面。</p>"""
     schema = {
         "@context": "https://schema.org", "@type": "Dataset",
         "name": "FedWatch Probability Change and Event Annotations",
-        "description": description, "url": canonical("/analysis/"), "dateModified": latest_key[:10],
+        "description": description, "url": canonical("/analysis/"), "dateModified": usd_state_day,
         "isBasedOn": CME_URL,
     }
     return page_document(title=title, description=description, path="/analysis/", body=body, schema=schema)
 
 
-def methodology_page(latest_key: str) -> str:
+def methodology_page(latest_key: str, rows: list[dict] | None = None) -> str:
+    usd = us_day_map(rows or [])
+    latest_day = usd.get(latest_key, latest_key[:10])
     title = "数据来源、采集时间与计算口径 | FedWatch Tracker"
-    description = "说明 FedWatch Tracker 的 CME QuikStrike 数据来源、每日快照时间、Aggregated 概率口径、交易日归档和历史数据限制。"
+    description = "说明 FedWatch Tracker 的 CME QuikStrike 数据来源、每个美东交易日收盘后的采集时点、Aggregated 概率口径与历史数据限制。"
     body = f"""<div class="breadcrumbs"><a href="/">首页</a> / 方法</div><h1>数据来源与方法</h1>
 <p class="lede">本站的目标是保存可审计的 FedWatch 概率快照与历史变化，而不是替代 CME 的盘中实时工具。</p>
 <h2>数据来源</h2><p>最新概率来自 <a href="{CME_URL}" rel="nofollow">CME FedWatch Tool 的 QuikStrike Aggregated View</a>；历史区间数据来自同一工具的 Historical Downloads。FOMC 日期参考<a href="{FED_CALENDAR_URL}" rel="nofollow">美联储 FOMC 官方日历</a>。</p>
-<h2>更新时点</h2><p>采集任务按北京时间每日 10:00 触发，失败时最多重试三次。CME 页面会随联邦基金期货盘中价格变化，因此本站显示的是带时间戳的定时快照，不承诺与用户稍后打开 CME 页面时的数值相同。当前页面最近构建于 <time datetime="{esc(latest_key.replace(' ','T'))}">{esc(latest_key)} 北京时间</time>。</p>
+<h2>更新时点</h2><p>采集目标是<b>每个美东交易日的收盘定格值</b>：任务在北京时间 <b>05:30</b>（美国夏令时）与 <b>06:30</b>（冬令时）各触发一次，两者折算到芝加哥时间都是<b>前一日 16:30 CT</b> —— 即 CME 每日 16:00–17:00 CT 休市间隙的中点，此时上一个交易日刚收盘、新时段尚未开盘。不在该窗口内的那次触发不会启动浏览器、也不会写入数据；成功采集后失败重试最多三次。CME 页面会随联邦基金期货盘中价格变化，因此本站显示的是带时间戳的定时快照，不承诺与用户稍后打开 CME 页面时的数值相同。当前最新数据点为 <time datetime="{esc(latest_day)}">{esc(latest_day)}</time>（美东交易日）。</p>
 <h2>Aggregated 概率</h2><p>累计加息、维持和降息概率以当前目标区间为基准，将会议后所有更高、相同或更低的目标区间概率分别求和。本站直接保存 QuikStrike 页面展示值，不自行替代官方页面的内部计算。</p>
 <h2>最大概率区间历史</h2><p>历史折线选择每个交易日概率最高的目标利率区间，并记录该区间及其概率。若市场最可能区间发生切换，折线会直接连接到新最高概率档。远期会议尚无有效定价时的全零占位行不绘制。</p>
-<h2>交易日和时区</h2><p>页面统一使用北京时间显示本站采集时刻。周末如果 QuikStrike 仍返回上一交易日行情，图表按最近工作日归档，同时原始快照保留实际抓取时间，以避免把周六或周日误当成新交易日。</p>
+<h2>交易日和时区</h2><p>横轴与各页显示的日期统一为<b>美东交易日</b>（<code>us_trade_date</code> 列）：一个点 = 一个已收盘的美东交易日。因北京无夏令时而美东有，采集点会比北京时间早一天出现在横轴上（北京 09-18 采集 → 横轴 09-17），这是口径使然，不是数据延迟。CME 周五 16:00 CT 收盘后要到周日 17:00 CT 才重开，因此周六/周日/周一北京早上的三次采集读到的是同一份周五收盘定格，本站按「一个交易日一个点」去重并保留最早那一次。原始的采集时刻、数据时点与口径标记都逐条保存在 <code>data/snapshots/YYYY-MM-DD.json</code> 与 CSV 的 <code>data_asof_ct</code> / <code>time_basis</code> 列中。</p>
 <h2>限制与免责声明</h2><ul><li>本站是独立项目，不隶属于 CME Group 或美联储。</li><li>数据仅供研究和信息参考，不构成投资建议。</li><li>历史下载和定时快照可能与盘中实时值存在差异。</li><li>“FedWatch”是 CME 产品名称；本站引用该名称仅用于描述数据来源和主题。</li></ul>"""
     return page_document(title=title, description=description, path="/methodology/", body=body)
 
 
 def data_page(rows: list[dict], latest_key: str) -> str:
-    first = min(r["snapshot_cn"][:10] for r in rows if r.get("snapshot_cn"))
+    usd = us_day_map(rows)
+    first = min(usd.values()) if usd else latest_key[:10]
+    last = max(usd.values()) if usd else latest_key[:10]
     meetings = len({r["meeting_date"] for r in rows})
     title = "FedWatch 历史概率 CSV 与数据字典 | FedWatch Tracker"
     description = "下载 FedWatch Tracker 的 FOMC 概率历史 CSV，查看字段定义、更新时间、覆盖范围和数据来源。"
     fields = [
-        ("snapshot_cn", "本站快照时间，北京时间"), ("snapshot_quikstrike", "QuikStrike 页面显示的数据时间"),
+        ("snapshot_cn", "本站采集时刻（北京时间；排序键与事件关联键，不建议作为横轴）"),
+        ("us_trade_date", "该数据对应的**美东交易日**，看板横轴用这一列"),
+        ("data_asof_ct", "页面自带的 “Data as of” 数据时点（CT），回填行为空"),
+        ("time_basis", "口径来源：page_asof（收盘后采集）/ settlement_export（官方结算导出）/ legacy_intraday（早期盘中读数）"),
+        ("snapshot_quikstrike", "QuikStrike 页面显示的数据时间原文"),
         ("meeting_date", "FOMC 决议日期"), ("current_target", "当前联邦基金目标区间，单位 bp"),
         ("agg_p_hike_pct / hold / cut", "最新快照的累计加息、维持、降息概率"),
         ("max_range_label / max_range_pct", "该会议概率最高的目标区间及其概率"),
@@ -344,14 +443,14 @@ def data_page(rows: list[dict], latest_key: str) -> str:
     ]
     field_rows = "".join(f"<tr><td><code>{esc(k)}</code></td><td>{esc(v)}</td></tr>" for k, v in fields)
     body = f"""<div class="breadcrumbs"><a href="/">首页</a> / 数据下载</div><h1>历史概率数据下载</h1>
-<p class="lede">下载本站用于看板和会议历史页的处理后时间序列。数据覆盖 {first} 至 {latest_key[:10]}，包含 {len(rows):,} 行、{meetings} 个未来会议标识。</p>
+<p class="lede">下载本站用于看板和会议历史页的处理后时间序列。数据覆盖美东交易日 {first} 至 {last}，包含 {len(rows):,} 行、{meetings} 个未来会议标识。</p>
 <div class="card"><h2 style="margin-top:0">主数据集</h2><p><a href="/data/fedwatch-probabilities.csv" download><strong>下载 fedwatch-probabilities.csv</strong></a> · UTF-8 · 每日构建更新</p><p class="small">来源：CME QuikStrike FedWatch Aggregated View / Historical Downloads。使用或再发布时请保留来源和快照时间说明，并遵守原始数据源适用条款。</p></div>
 <h2>按会议下载</h2><div class="site-links">{''.join(f'<a href="/data/meetings/{m}.csv" download>{m}.csv</a> ' for m in sorted({r['meeting_date'] for r in rows}))}</div>
 <h2>字段说明</h2><div class="table-wrap"><table><thead><tr><th>字段</th><th>含义</th></tr></thead><tbody>{field_rows}</tbody></table></div>
-<h2>引用建议</h2><p>引用数字时请同时注明：会议日期、本站快照时间、概率口径及数据来源。例如：“FedWatch Tracker，{esc(latest_key)} 北京时间快照，数据源 CME QuikStrike Aggregated View”。</p>"""
+<h2>引用建议</h2><p>引用数字时请同时注明：会议日期、对应的美东交易日、概率口径及数据来源。例如：“FedWatch Tracker，美东交易日 {esc(last)} 收盘快照，数据源 CME QuikStrike Aggregated View”。</p>"""
     schema = {
         "@context": "https://schema.org", "@type": "Dataset", "name": "FedWatch Tracker Historical FOMC Rate Probabilities",
-        "description": description, "url": canonical("/data/"), "dateModified": latest_key[:10], "temporalCoverage": f"{first}/{latest_key[:10]}",
+        "description": description, "url": canonical("/data/"), "dateModified": last, "temporalCoverage": f"{first}/{last}",
         "isBasedOn": CME_URL, "distribution": [{"@type": "DataDownload", "encodingFormat": "text/csv", "contentUrl": canonical("/data/fedwatch-probabilities.csv")}],
     }
     return page_document(title=title, description=description, path="/data/", body=body, schema=schema)
@@ -376,8 +475,11 @@ def english_page(latest_key: str, latest: list[dict]) -> str:
     )
     title = "FedWatch Tracker: Fed Rate Hike and Cut Probability History"
     description = "Daily CME FedWatch probability snapshots, historical FOMC target-rate distributions, meeting-level history and downloadable CSV data."
+    latest_day = (latest[0].get("us_trade_date") or "").strip() if latest else ""
+    if not latest_day:
+        latest_day = latest_key[:10]
     body = f"""<div class="breadcrumbs"><a href="/en/">Home</a></div><h1>Fed Rate Probability History</h1>
-<p class="lede">FedWatch Tracker publishes daily snapshots of rate-hike, hold and rate-cut probabilities for upcoming FOMC meetings, plus one-year meeting-level history and downloadable data.</p><div class="meta">Latest snapshot: <time datetime="{esc(latest_key.replace(' ','T'))}">{esc(latest_key)} China Standard Time (UTC+8)</time></div>
+<p class="lede">FedWatch Tracker publishes daily closing snapshots of rate-hike, hold and rate-cut probabilities for upcoming FOMC meetings, plus one-year meeting-level history and downloadable data. One point = one US trading day, taken after the 16:00 CT close.</p><div class="meta">Latest data point: <time datetime="{esc(latest_day)}">{esc(latest_day)}</time> (US trading day)</div>
 <div class="notice">This is an independent research and data-tracking project. It is not affiliated with CME Group or the Federal Reserve. Values are scheduled snapshots, not guaranteed intraday real-time quotes.</div>
 <h2>Upcoming meetings</h2><div class="grid">{cards}</div><h2>Explore the data</h2><ul><li><a href="/history/">Meeting-level probability history</a></li><li><a href="/data/">Download historical CSV data</a></li><li><a href="/methodology/">Source, snapshot time and methodology</a></li><li><a href="/">Chinese interactive dashboard</a></li></ul>"""
     return page_document(title=title, description=description, path="/en/", body=body, lang="en", alternate_zh="/", alternate_en="/en/")
@@ -419,7 +521,18 @@ def write_assets(latest_key: str) -> None:
         pass
 
 
-def write_robots_sitemap(paths: list[str], latest_key: str) -> None:
+def curves_page_url() -> str | None:
+    """双图页（report/curves.html，由 build_curves.py 生成）的规范地址。
+
+    文件不存在时返回 None —— sitemap / llms.txt 只在页面真实存在时收录，
+    避免 build_report 先于 build_curves 运行的首轮部署挂出死链。
+    """
+    if (REPORT_DIR / "curves.html").is_file():
+        return canonical("/curves")
+    return None
+
+
+def write_robots_sitemap(paths: list[str], latest_key: str, extras: tuple[str, ...] = ()) -> None:
     robots = f"""User-agent: *
 Allow: /
 
@@ -429,8 +542,11 @@ Allow: /
 Sitemap: {canonical('/sitemap.xml')}
 """
     (REPORT_DIR / "robots.txt").write_text(robots, encoding="utf-8")
+    # extras：不对应 write_page 产物的页面（如 curves.html 这种文件型页面），
+    # 只进 sitemap、不参与 validate_site 的 canonical 逐页校验。
     entries = "".join(
-        f"<url><loc>{esc(canonical(path))}</loc><lastmod>{latest_key[:10]}</lastmod></url>" for path in paths
+        f"<url><loc>{esc(canonical(path))}</loc><lastmod>{latest_key[:10]}</lastmod></url>"
+        for path in list(paths) + list(extras)
     )
     sitemap = f'<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">{entries}</urlset>'
     (REPORT_DIR / "sitemap.xml").write_text(sitemap, encoding="utf-8")
@@ -453,10 +569,11 @@ def write_llms(latest_key: str, latest: list[dict]) -> None:
 
 Independent daily tracker of CME FedWatch / QuikStrike probability snapshots and historical FOMC target-rate distributions. Not affiliated with CME Group or the Federal Reserve.
 
-Latest snapshot: {latest_key} China Standard Time (UTC+8). Values are scheduled snapshots, not guaranteed intraday real-time quotes.
+Latest data point: US trading day {(latest[0].get("us_trade_date") or latest_key[:10]).strip() if latest else latest_key[:10]} (one point per US trading day, sampled after the 16:00 CT close). Values are scheduled snapshots, not guaranteed intraday real-time quotes.
 
 Primary pages:
 - Dashboard: {canonical('/')}
+- Direction & magnitude charts (cumulative hike probability, expected bp): {curves_page_url() if curves_page_url() else '(not generated)'}
 - Meeting history index: {canonical('/history/')}
 - Probability change and event analysis: {canonical('/analysis/')}
 - Methodology and source: {canonical('/methodology/')}
@@ -531,24 +648,27 @@ def build_static_site(home_html: str, rows: list[dict]) -> tuple[str, list[str]]
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     clean_generated_site()
     latest_key, latest = latest_rows(rows)
+    records = page_meetings(rows, latest)
     latest_by_meeting = {r["meeting_date"]: r for r in latest}
+    archived = {m: r for m, r in records.items() if m not in latest_by_meeting}
     enhanced_home = build_homepage_meta(home_html, rows, latest_key, latest)
-    write_page("/history/", history_page(rows, latest_key, latest))
+    write_page("/history/", history_page(rows, latest_key, latest, archived))
     write_page("/analysis/", analysis_page(rows, latest_key))
-    write_page("/methodology/", methodology_page(latest_key))
+    write_page("/methodology/", methodology_page(latest_key, rows))
     write_page("/data/", data_page(rows, latest_key))
     write_page("/about/", about_page())
     write_page("/en/", english_page(latest_key, latest))
     meeting_paths = []
-    for meeting in sorted(latest_by_meeting):
+    for meeting in sorted(records):
         path = f"/meetings/{meeting}/"
-        write_page(path, meeting_page(rows, meeting, latest_key, latest_by_meeting))
+        write_page(path, meeting_page(rows, meeting, latest_key, records))
         meeting_paths.append(path)
     write_csv_downloads(rows)
     write_assets(latest_key)
     write_404()
     paths = ["/", "/history/", "/analysis/", "/methodology/", "/data/", "/about/", "/en/", *meeting_paths]
-    write_robots_sitemap(paths, latest_key)
+    write_robots_sitemap(paths, latest_key,
+                         extras=("/curves",) if curves_page_url() else ())
     write_llms(latest_key, latest)
     copy_static_root_files()
     (REPORT_DIR / "_headers").write_text(
