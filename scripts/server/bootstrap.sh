@@ -77,11 +77,13 @@ runuser -u "$RUN_AS" -- bash -c "cd '$APP' && export PATH='$APP/node_modules/.bi
   || log "警告：agent-browser install 失败，稍后用 doctor 排查"
 
 # ---------- 6. GitHub 部署密钥（回推每日数据） ----------
+mkdir -p "$KEY_DIR"
+chown -R "$RUN_AS:$RUN_AS" "$KEY_DIR"
+chmod 700 "$KEY_DIR"
 if [[ ! -f "$KEY_FILE" ]]; then
   log "生成部署密钥 $KEY_FILE"
   runuser -u "$RUN_AS" -- ssh-keygen -q -t ed25519 -N '' -C 'fedwatch-server-deploy' -f "$KEY_FILE"
 fi
-chown -R "$RUN_AS:$RUN_AS" "$KEY_DIR"
 chmod 600 "$KEY_FILE"
 if [[ ! -f "$KEY_DIR/known_hosts" ]] || ! grep -q github.com "$KEY_DIR/known_hosts"; then
   ssh-keyscan -t ed25519,rsa github.com 2>/dev/null >> "$KEY_DIR/known_hosts"
