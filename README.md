@@ -12,9 +12,9 @@
 > | **10/28** | 3.75% – 4.00% | **60.00%** | +25bp 累计 |
 > | **12/9** | 4.00% – 4.25% | **91.30%** | +50bp 累计 |
 
-每日 10:00 北京时间采集、累积起来，看板就会形成 3 条"市场对该会议加息预期的最大概率"折线图。
+每日收盘窗口北京时间 05:30/06:30（服务器定时）采集、累积起来，看板就会形成 3 条"市场对该会议加息预期的最大概率"折线图。
 
-公开站点：<https://fedwatch-tracker.pages.dev/>。公开代码仓库：<https://github.com/Stayfoool/fedwatch-tracker>。站点继续托管在 Cloudflare Pages；托管平台本身不会阻止搜索收录。项目已经从单一 JS 看板升级为可抓取的多页静态站点，包含会议历史页、方法页、数据下载页、中英文入口、robots、sitemap、结构化数据和真实 404。维护者姓名、组织、邮箱和联系方式目前不公开。
+公开站点：<http://8.215.88.73/>（阿里云轻量服务器每日采集并直接托管）。公开代码仓库：<https://github.com/Stayfoool/fedwatch-tracker>；Mac 本地开发 → push GitHub → 服务器拉取部署（服务器采集的新数据每日回推 GitHub）。旧 Cloudflare Pages 站点已停止更新。项目已经从单一 JS 看板升级为可抓取的多页静态站点，包含会议历史页、方法页、数据下载页、中英文入口、robots、sitemap、结构化数据和真实 404。维护者姓名、组织、邮箱和联系方式目前不公开。
 
 ## 一、看板怎么看
 
@@ -173,7 +173,7 @@ CME FedWatch Tool 的用户指南明确写明：工具左侧 "**Downloads**" 面
 4. 重建 `report/index.html`。
 
 因为幂等，可以重复跑；但它不是每日采集流程的一部分。本站现有历史已完成初始化，
-日常只追加每天 10:00（失败时 10:10 / 10:20 重试）的实际快照；如将来确有历史缺口，再手动运行该脚本。
+日常只追加每个收盘窗口（服务器定时）的实际快照；如将来确有历史缺口，再手动运行该脚本。
 
 **注意**：想要早于 1 年的历史，FedWatch 不再提供。那条路只能回到
 "自算"（用自己的算法从 ZQ 结算价推导），但 FedWatch 有未公开细节，
@@ -228,20 +228,22 @@ QuikStrike 拒绝 referer 非 cmegroup.com 的请求，
 | FedWatch Intraday API | 每分钟 | 付费 |
 
 **结论**：QuikStrike 页面本身随盘中期货价实时变动，但本站不追踪盘中变化。
-本站公开数据以 **北京时间每天 10:00 的定时抓取**为准；如果失败，最多在 10:10、10:20 重试，
-任一次成功即停止。10:10 / 10:20 是失败重试，不是额外的常规采集点。
-周末/节假日时 QuikStrike 显示的是上一个交易日的收盘数据，本站按最近工作日归档。
+本站公开数据以**美东收盘后的休市间隙定时抓取**为准：阿里云服务器每天北京时间
+**05:30 与 06:30** 双触发（夏令时由 05:30 命中、冬令时由 06:30 命中，折算到芝加哥都是
+前一日 16:30 CT）；不在窗口内的那次自动跳过，落在窗口内的那次失败则 +10/+20 分钟重试，
+最多 3 次。周末/节假日时 QuikStrike 显示的是上一个交易日的收盘数据，本站按最近工作日归档。
 
-任务由 macOS 用户级 LaunchAgent `com.workbuddy.fedwatch-tracker.daily` 触发。采集和报告重建成功后，
-`run_daily.sh` 会自动调用 `deploy_pages.sh`，把 `report/` 发布到现有 Cloudflare Pages production，
-并验证生产首页与本地产物一致；同时检查 robots、sitemap、历史页、CSV、Content-Type 和真实 404。
-发布失败会每 60 秒重试，最多 3 次，不会重复抓取。当前已验证的 SEO 站点 deployment 为 `be2bb859`。
+任务由阿里云轻量服务器（Debian 12）上的 systemd 定时器 `fedwatch-daily.timer` 触发：
+采集和报告重建成功后，`run_daily.sh` 调用 `publish_report.sh` 把 `report/`
+发布到 nginx 站点目录（`/var/www/fedwatch/current`，原子切换），随后 `sync_data_git.sh`
+把新增数据回推 GitHub。公开站点：`http://8.215.88.73/`；旧 Cloudflare Pages 站点
+`https://fedwatch-tracker.pages.dev/` 已冻结在迁移日数据。部署细节见 `docs/deployment.md`。
 
 ## 七、采集流程
 
 ```
-agent-browser open <QuikStrike URL> --headers '{"Referer":"..."}'
-        │  ← 拿到 QuikStrike 注入 session ID 的真实 URL
+agent-browser open <QuikStrike URL> --headers '{"Referer":"...","Accept-Language":"zh-CN,..."}'
+        │  ← 拿到 QuikStrike 注入 session ID 的真实 URL（区域格式由 Accept-Language 决定）
         ▼  (sleep 8s 等 ASP.NET 异步加载完毕)
 eval: 查找 <a>text==='Aggregated' → click()
         │
@@ -262,10 +264,17 @@ fedwatch-tracker/
 ├── analyze_changes.py                   # 检测 ≥8pp 的重大变动日 → data/significant_changes.csv
 ├── build_report.py                      # 生成交互首页并调用 SEO 静态站点构建
 ├── site_seo.py                          # 生成内容页、metadata、sitemap、robots、CSV 等
-├── run_daily.sh                         # 每日采集→构建→生产发布总入口
-├── deploy_pages.sh                      # 安全发布 Pages，并验证 production 内容
-├── install_launchagent.sh               # 安装/更新每天 10:00 的 LaunchAgent
+├── run_daily.sh                         # 每日采集→构建→发布总入口（发布渠道可由环境变量替换）
+├── deploy_server.sh                     # Mac 端部署触发：让阿里云服务器从 GitHub 拉取重建
+├── publish_report.sh                    # 服务器端：report/ 原子发布到 nginx 站点目录
+├── sync_data_git.sh                     # 服务器端：采集成功后把新数据回推 GitHub
+├── deploy_pages.sh                      # （可选）安全发布 Cloudflare Pages，并验证 production 内容
+├── install_launchagent.sh               # （可选）Mac 本地回切方案：安装 05:30/06:30 LaunchAgent
 ├── launchd/com.workbuddy.fedwatch-tracker.daily.plist
+├── scripts/
+│   ├── nginx/fedwatch.conf              # 服务器 nginx 站点（裸 IP:80 default_server）
+│   ├── systemd/fedwatch-daily.{service,timer}
+│   └── server/{bootstrap.sh,fedwatch-deploy}  # 服务器初始化与部署器
 ├── package.json / package-lock.json      # 固定 agent-browser 与 Wrangler 版本
 ├── data/
 │   ├── fedwatch_probabilities.csv       # 主存档（长表，按 snapshot_cn+meeting 去重）
@@ -331,21 +340,29 @@ $PY $DIR/backfill_history.py            # 需要时手动回填 1 年历史（�
 $PY $DIR/analyze_changes.py             # 检测 ≥8pp 的重大变动日（最近 30 天）
 $PY $DIR/analyze_changes.py --days 7    # 只看最近 7 天
 $PY $DIR/build_report.py                # 重建并验证完整 report/ 静态站点
-zsh $DIR/deploy_pages.sh                 # 只部署并验证当前 report/
-zsh $DIR/run_daily.sh                    # 抓取、构建、检测、部署的完整流程
-zsh $DIR/install_launchagent.sh           # 安装/更新每天 10:00 的定时任务
+./deploy_server.sh                        # 推送后一键部署：服务器拉取、构建、发布
+zsh $DIR/deploy_pages.sh                 # （可选）只部署 Pages 并验证当前 report/
+zsh $DIR/run_daily.sh                    # 抓取、构建、检测、发布的完整流程（Mac 本地调试用）
+zsh $DIR/install_launchagent.sh           # （可选）Mac 回切方案：安装 05:30/06:30 双触发定时任务
 ```
 
 Cloudflare Token 只保存在仓库外的 `~/.config/cloudflare/fedwatch-pages.token`；目录权限为 `700`、
 文件权限为 `600`。脚本会在部署前强制校验文件类型、所有者和权限，不会把 Token 输出到日志。
-定时任务日志位于 `logs/fetch_YYYYMMDD.log`，LaunchAgent 自身输出位于
-`logs/launchd.stdout.log` 和 `logs/launchd.stderr.log`。
+迁移到阿里云后日常流程不再触碰 Cloudflare；该 Token 仅在手动运行 `deploy_pages.sh` 时使用。
+GitHub 侧另有服务器专用读写 Deploy Key（`/etc/fedwatch/ssh/`，仅 fedwatch 用户可读），只用于每日数据回推。
+定时任务日志位于 `logs/fetch_YYYYMMDD.log`；服务器端采集输出见
+`journalctl -u fedwatch-daily.service`，部署日志见 `/var/log/fedwatch/deploy.log`。
 
 ## 十、依赖
 
 - Node.js 22 与 npm
 - 项目内固定版本 `agent-browser@0.27.0`（官方 npm 包；该版本与现有 QuikStrike Referer 流程兼容）
-- 项目内固定版本 `wrangler@4.131.1`（官方 Cloudflare CLI）
-- Google Chrome 或兼容 Chromium
-- Python 3.11+（建议使用虚拟环境）
+- agent-browser 托管 Chromium（服务器上由 `agent-browser install` 下载；本机也可用 Chrome）
+- Python 3.11+（脚本全部为标准库，无需 pip 安装；服务器为 Debian 12 自带 3.11）
 - 网络可达 `cmegroup-tools.quikstrike.net`（不可达 `www.cmegroup.com` 也无影响）
+- （可选）`wrangler@4.131.1`：仅在手动发布 Cloudflare Pages 时使用
+
+服务器端（阿里云轻量，Debian 12）：nginx 1.22（静态托管 + 裸 IP:80 default_server）、
+systemd timer（05:30/06:30 Asia/Shanghai 双触发）、git（读写 Deploy Key 回推数据）、
+2G swap（保障 headless Chromium）。初始化由 `scripts/server/bootstrap.sh` 幂等完成，
+架构与操作详见 `docs/deployment.md`。

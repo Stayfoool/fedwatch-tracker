@@ -2,147 +2,121 @@
 
 > 项目的整体方向、阶段和待办统一维护在根目录 `ROADMAP.md`。本文只记录部署架构、操作步骤和验证状态。
 
-## 当前目标
+## 当前架构（2026-09-30 起）
 
-在每日采集和站点构建成功后，将完整 `report/` 静态目录安全发布到现有 Cloudflare Pages 生产站点 `https://fedwatch-tracker.pages.dev/`；不新建 Pages 项目。
+采集、构建、发布全部在**阿里云轻量服务器**（Debian 12，公网 `8.215.88.73`）上运行；
+Mac 只做开发，通过 GitHub 中转部署。站点为纯静态，由服务器 nginx 直接托管：
+
+- 公开站点：`http://8.215.88.73/`（nginx `default_server:80` → `/var/www/fedwatch/current`）
+- 代码仓库：<https://github.com/Stayfoool/fedwatch-tracker>（公开）
+- 每日采集：systemd timer `fedwatch-daily.timer`，北京时间 **05:30 与 06:30** 双触发
+  （夏令时 05:30 命中、冬令时 06:30 命中芝加哥前一日 16:30 收盘窗口；不在窗口的那次由
+  `fetch_quikstrike.py` 以 exit 10 自行跳过）
+- 数据回流：采集成功后服务器把新增快照/主 CSV **回推 GitHub**（读写 Deploy Key），
+  Mac 端 `git pull` 即可同步；归因任务（Mac，07:30）写完 `data/events.csv` 后
+  commit+push 并触发服务器重建
+- 旧 Cloudflare Pages 站点 `https://fedwatch-tracker.pages.dev/` 停止更新（历史存档）
+
+## 服务器布局
+
+```text
+/opt/fedwatch-tracker          # 仓库克隆（属主 fedwatch 系统用户）
+├── run_daily.sh               # 每日总入口（systemd 调用）
+├── publish_report.sh          # report/ → /var/www/fedwatch/releases/<ts> + current 软链原子切换
+├── sync_data_git.sh           # 采集成功后把新数据回推 GitHub（ExecStartPost）
+└── logs/                      # logs/fetch_YYYYMMDD.log
+/var/www/fedwatch/
+├── releases/<时间戳>/          # 每次发布的完整静态站点，保留最近 5 份
+└── current -> releases/...    # nginx root
+/etc/fedwatch/ssh/             # GitHub 读写 Deploy Key（fedwatch 私有，600）
+/etc/systemd/system/fedwatch-daily.{service,timer}
+/etc/nginx/conf.d/fedwatch.conf  # 接管裸 IP:80 default_server
+/usr/local/sbin/fedwatch-deploy  # root 运行的部署器（Mac deploy_server.sh 触发）
+/var/log/fedwatch/deploy.log     # 部署日志
+```
 
 ## 关键决策
 
-- 部署目录是 `report/`，不是项目根目录。
-- 站点是预生成静态站点，无服务端运行时；首页保留原生 SVG/JavaScript 交互。
-- 使用已有 Pages 项目 `fedwatch-tracker` 的 Direct Upload / production `main` 分支覆盖。
-- API token 不写入项目、脚本、文档或日志；仅从项目外权限为 `600` 的文件读取。
-- 使用固定版本的官方 Wrangler CLI，避免每日运行时漂移到未经验证的新版本。
-- macOS LaunchAgent 每天北京时间 **05:30 与 06:30** 各触发一次 `run_daily.sh`
-  （夏令时由 05:30 命中、冬令时由 06:30 命中，折算到芝加哥都是前一日 16:30 CT 的收盘后休市间隙）；
-  不在采集窗口内的那次由 `fetch_quikstrike.py` 以 exit 10 跳过，不重试、不发布；发布失败返回非零并写入日志。
-- `FEDWATCH_SITE_URL` 控制构建时的 canonical 基址；未设置时为 `https://fedwatch-tracker.pages.dev`。
-- 维护者身份、组织、邮箱和联系方式当前不写入页面或结构化数据。
+- 发布目录是构建产物 `report/`；nginx 端 `try_files $uri $uri/ $uri.html` 与
+  Cloudflare Pages 的 clean URL（如 `/curves`）保持一致。
+- 构建时 `FEDWATCH_SITE_URL=http://8.215.88.73`（systemd 单元与 fedwatch-deploy 内置），
+  canonical / sitemap / OG 指向服务器地址。将来绑定域名：改该环境变量 + nginx
+  `server_name` + DNS/备案，不能只改环境变量。
+- 服务器以 `fedwatch` 系统用户运行（nginx 只读 releases；构建与采集不碰 root）。
+- 抓取会话固定注入 `Accept-Language: zh-CN`：QuikStrike 按 Accept-Language 决定区域格式，
+  zh-CN 会话的会议日期（`YYYY/M/D`）与 Data-as-of（中文月名）正是下游解析器支持且
+  Mac 端实测过的格式；`EXTRACT_JS` 同时兼容 en-US 的 `M/D/YYYY` 作为兜底。
+- 首次部署用 `scripts/server/bootstrap.sh`（幂等）：系统依赖、Node 22、`agent-browser
+  install`（托管 Chromium）、仓库克隆、Deploy Key、nginx、systemd、首次构建发布。
+- 服务器内存 1.6G，已加 2G swap 保障 headless Chromium。
 
-## 架构摘要
-
-1. `fetch_quikstrike.py` 抓取并归档概率数据。
-2. `build_report.py` 构建交互首页，并调用 `site_seo.py` 生成多页静态站点。
-3. 构建器校验 metadata、canonical、结构化数据、内部链接、sitemap、CSV 和图片资源。
-4. `deploy_pages.sh` 将整个 `report/` 上传到现有 Cloudflare Pages 项目。
-5. 部署后脚本对线上首页、robots、sitemap、历史页、CSV、Content-Type 和 404 状态做生产验证。
-
-当前 `report/` 的主要产物：
-
-```text
-report/
-├── index.html
-├── history/index.html
-├── methodology/index.html
-├── data/index.html
-├── about/index.html
-├── en/index.html
-├── meetings/<YYYY-MM-DD>/index.html
-├── data/fedwatch-probabilities.csv
-├── data/meetings/<YYYY-MM-DD>.csv
-├── robots.txt
-├── sitemap.xml
-├── llms.txt
-├── google368ccf4bdf1ec30d.html
-├── 404.html
-├── _headers
-├── favicon.svg
-└── assets/og-image.{svg,png}
-```
-
-## 部署状态（2026-09-15）
-
-- [x] 固定并安装官方 Wrangler CLI `4.131.1`
-- [x] 固定兼容现有抓取流程的官方 `agent-browser@0.27.0`
-- [x] 安全部署脚本检查 token 文件类型、所有者和权限
-- [x] `run_daily.sh` 接入 Pages 发布，并对暂时性发布失败重试
-- [x] 安装并加载 macOS LaunchAgent（每日 05:30 / 06:30 双触发）
-- [x] 从单页看板升级为多页 SEO 静态站点
-- [x] 生成 robots、sitemap、真实 404、canonical、结构化数据和 CSV 下载
-- [x] 构建失败阻止发布旧的或不完整的站点
-- [x] 实际发布并验证生产 deployment `be2bb859`
-
-## 当前线上结果
-
-- 生产 URL：`https://fedwatch-tracker.pages.dev/`
-- 已验证 deployment：`be2bb859`
-- Unique URL：`https://be2bb859.fedwatch-tracker.pages.dev/`
-- 首页标题：`FedWatch Tracker：美联储加息与降息概率历史 | Fed Rate Probability History`
-- sitemap 中有 18 个可索引页面
-- `robots.txt`：纯文本，允许抓取并声明 sitemap
-- `sitemap.xml`：有效 XML
-- 不存在路径：HTTP 404
-- 首页、robots、sitemap、历史页和完整 CSV：线上与本地产物一致
-
-## 已实施流程
-
-1. LaunchAgent 每天本机时间 05:30 与 06:30 各调用一次 `run_daily.sh`；只有落在
-   芝加哥时间 `[16:02, 16:58)` 休市间隙内的那次会真正采集，另一次以 exit 10 跳过。
-2. 抓取最多尝试 3 次（间隔 10 分钟，仍在窗口内），成功后重建完整站点；构建或验证失败不发布。
-   抓取返回 10/11/12（不在窗口 / 该交易日已有收盘读数 / 数据未变）视为正常跳过，不重试也不发布。
-3. 重大变动检测为非阻断步骤。
-4. Pages 发布最多尝试 3 次；每次由固定版本 Wrangler 上传 production `main`。
-5. `deploy_pages.sh` 等待 production alias 传播，然后验证：
-   - 首页 SHA-256 与本地一致；
-   - robots、sitemap、history 页面和 CSV 与本地一致；
-   - robots Content-Type 为 `text/plain`；
-   - sitemap Content-Type 为 XML；
-   - 随机不存在路径返回 404。
-
-## 手动构建与部署
+## 日常流程
 
 ```bash
-PY=python3
-DIR=/path/to/fedwatch-tracker
+# Mac：开发 → 部署（要求工作区干净、已推送）
+git push origin main && ./deploy_server.sh
 
-$PY $DIR/build_report.py
-zsh $DIR/deploy_pages.sh
+# 服务器：手动重建并发布当前 origin/main
+ssh root@8.215.88.73 /usr/local/sbin/fedwatch-deploy main
+
+# 服务器：手动触发一次每日采集（不在窗口内会自动跳过）
+ssh root@8.215.88.73 'systemctl start fedwatch-daily.service'
+journalctl -u fedwatch-daily.service -n 50        # 查看运行输出
+systemctl list-timers fedwatch-daily.timer        # 查看下次触发
 ```
 
-完整日常流程：
+每日自动链路（北京时间）：
 
-```bash
-zsh $DIR/run_daily.sh
-```
-
-如将来绑定独立域名，构建前设置无末尾斜杠的规范地址：
-
-```bash
-FEDWATCH_SITE_URL=https://example.com $PY $DIR/build_report.py
-```
-
-同时必须完成 Cloudflare custom domain、旧域名 301、Search Console/Bing 新属性、canonical 和 sitemap 的线上复核；不能只修改环境变量。
-
-## Google Search Console 所有权验证
-
-- 主要验证方式：生产首页 `<head>` 中长期保留 `google-site-verification` meta。
-- 备用验证文件：`static/google368ccf4bdf1ec30d.html`；`site_seo.py` 在每次构建时复制到 `report/` 并校验内容，避免后续部署误删。
-- 验证文件和 meta 只证明对站点部署内容的控制权，不包含维护者姓名、邮箱或联系方式。
-- 不要在日常重构中删除验证 meta 或验证文件；删除后 Google 可能撤销已验证状态。
+1. **05:30 / 06:30** `fedwatch-daily.service`：`run_daily.sh` → 抓取（失败 +10/+20 分钟重试，
+   最多 3 次）→ `snapshot_pick.py` 自检 → `build_report.py` → `build_curves.py` →
+   `analyze_changes.py --days 7` → `publish_report.sh` 发布 → `sync_data_git.sh`
+   把新增数据 commit+push 回 GitHub。
+2. **07:30** Mac 端 ZCode 归因自动化：`git pull --rebase` 同步数据 → 检测未归因日 →
+   按 `docs/auto-attribution.md` 检索归因 → 本地构建 + JS 语法校验 →
+   commit+push → `./deploy_server.sh` 触发服务器重建发布。
 
 ## 密钥
 
-- API token、upload JWT **不写入项目**；account ID 只存在被忽略的本地 Wrangler cache。
-- 本机 token 文件：`~/.config/cloudflare/fedwatch-pages.token`，父目录权限 `700`、文件权限 `600`。
-- `deploy_pages.sh` 强制检查 token 文件不是符号链接、所有者为当前用户且权限精确为 `600`。
-- token 仅传给单个 Wrangler 子进程，不写进 `docs/`、`.wrangler/`、命令回显或日志。
+- GitHub Deploy Key：`/etc/fedwatch/ssh/id_ed25519_github_push`（仅 fedwatch 可读，600），
+  对应仓库 Deploy Key `aliyun-fedwatch-server`（read-write）；只用于数据回推。
+- 服务器 SSH：Mac `~/.ssh/config` 已有 `8.215.88.73` 别名（root + ed25519）。
+- Cloudflare API token 仍只在 Mac 本机 `~/.config/cloudflare/fedwatch-pages.token`，
+  仅 `deploy_pages.sh`（可选的 Pages 发布）使用；迁移后日常流程不再触碰 Cloudflare。
 
-## 验证记录（2026-09-15）
+## 服务器初始化（已执行，存档备查）
 
-- [x] `python3 -m py_compile site_seo.py build_report.py`
-- [x] `python3 build_report.py` 生成 18 个可索引页面并通过本地站点验证
-- [x] 桌面首页、历史索引页和移动端历史索引页浏览器 QA 通过
-- [x] 浏览器控制台 0 error / 0 warning
-- [x] Wrangler 创建 deployment `be2bb859`
-- [x] production alias 与本地产物一致
-- [x] robots=`text/plain`、sitemap=XML、随机不存在路径=404
+```bash
+scp scripts/server/bootstrap.sh root@8.215.88.73:/tmp/ && \
+  ssh root@8.215.88.73 'bash /tmp/fedwatch-bootstrap.sh'
+# 按输出把公钥添加为仓库 Deploy Key（允许写）：
+#   ssh root@8.215.88.73 'cat /etc/fedwatch/ssh/id_ed25519_github_push.pub' > /tmp/dk.pub
+#   gh repo deploy-key add /tmp/dk.pub --title aliyun-fedwatch-server --allow-write
+# 再次运行 bootstrap 或 fedwatch-deploy 完成首次发布
+```
 
-## 风险与后续
+bootstrap 会把 `va2t.conf` 里原来的 `default_server`（`return 444` 空吞块）备份后移除，
+交给 `fedwatch.conf`；`va2t.giftern.cn` 的 80/443 域名站不受影响（已验证：301/401 如常）。
 
-- 电脑关机或长期未登录时，用户级 LaunchAgent 无法运行；恢复登录后需检查日志。
-- QuikStrike 抓取依赖浏览器和网络，失败时不会发布旧报告。
-- `pages.dev` 可被搜索引擎收录，但独立域名更适合长期品牌和外链积累；域名购买与绑定尚未执行。
-- Google Search Console URL-prefix property 已于 2026-09-15 通过 HTML meta 验证；`sitemap.xml` 已提交但即时状态为 `Couldn't fetch`，线上独立检查为 HTTP 200、XML Content-Type 且 Googlebot 可访问，需等待重读。
-- 首页 Request Indexing 于 2026-09-15 因 Google 当日配额已满未提交成功，需在次日或之后重试；Bing Webmaster Tools 尚未配置。
-- 需要轮换此前在聊天中暴露过的 Cloudflare API token。
-- 后续更新继续部署 `report/` 到现有项目 `fedwatch-tracker`，不要新建 Pages 项目。
+## 验证记录（2026-09-30 凌晨）
+
+- [x] 服务器全链路：`fetch_quikstrike.py --dry --force --json` 在服务器返回 10 个会议、
+      `current_target=375-400`、Data-as-of 中文格式（zh-CN 会话生效）
+- [x] 窗口守卫：非窗口时段真实运行返回 rc=10（out_of_window）
+- [x] `fedwatch-deploy`：checkout → py_compile → snapshot_pick 自检 → 构建（18 可索引页 +
+      curves 页）→ publish 原子切换
+- [x] 线上：首页 200、canonical=`http://8.215.88.73/`、`/curves` 200、history/en/about/methodology
+      301、robots/sitemap/CSV 200、不存在路径 404、`_headers` 404
+- [x] Deploy Key 回推：`git push --dry-run` 通过
+- [x] timer 就绪：NEXT = 次日 05:30:00 CST
+- [x] `va2t.giftern.cn`：HTTP 301 → HTTPS 401（basic auth），与迁移前一致
+- [x] Mac LaunchAgent 已停用移除（`install_launchagent.sh` 保留，需要回切时重装即可）
+
+## 已知问题与后续
+
+- 首个自动采集日（迁移后第一个交易日）建议核对 `journalctl -u fedwatch-daily` 与
+  GitHub 上的数据回流 commit。
+- 服务器无独立域名前站点为 `http://` 明文 + 裸 IP；SEO 长期方案是绑定域名
+  （需备案）后切 `FEDWATCH_SITE_URL` 并做 301。
+- `pages.dev` 旧站冻结在 2026-09-29 数据；如需下线或 301 到新站，在 Cloudflare 控制台操作。
+- Mac 端仍可随时 `zsh run_daily.sh` + `deploy_pages.sh` 双写 Pages（需重装 LaunchAgent），
+  但注意两边数据以 GitHub 为准，先 `git pull`。
