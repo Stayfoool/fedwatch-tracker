@@ -1,0 +1,216 @@
+{
+  "meetings": [
+    {
+      "meeting_date": "2026-10-28",
+      "probabilities": [
+        46.86,
+        53.14,
+        0,
+        0
+      ],
+      "ranges": [
+        "375-400",
+        "400-425",
+        "425-450",
+        "450-475"
+      ]
+    },
+    {
+      "meeting_date": "2026-12-09",
+      "probabilities": [
+        0,
+        74.63,
+        25.37,
+        0
+      ],
+      "ranges": [
+        "375-400",
+        "400-425",
+        "425-450",
+        "450-475"
+      ]
+    },
+    {
+      "meeting_date": "2027-01-27",
+      "probabilities": [
+        0,
+        29.86,
+        70.14,
+        0
+      ],
+      "ranges": [
+        "375-400",
+        "400-425",
+        "425-450",
+        "450-475"
+      ]
+    },
+    {
+      "meeting_date": "2027-03-17",
+      "probabilities": [
+        0,
+        0,
+        78.71,
+        21.29
+      ],
+      "ranges": [
+        "375-400",
+        "400-425",
+        "425-450",
+        "450-475"
+      ]
+    },
+    {
+      "meeting_date": "2027-04-28",
+      "probabilities": [
+        0,
+        0,
+        35.86,
+        64.14
+      ],
+      "ranges": [
+        "375-400",
+        "400-425",
+        "425-450",
+        "450-475"
+      ]
+    },
+    {
+      "meeting_date": "2027-06-09",
+      "probabilities": [
+        0,
+        0,
+        26.46,
+        73.54
+      ],
+      "ranges": [
+        "375-400",
+        "400-425",
+        "425-450",
+        "450-475"
+      ]
+    },
+    {
+      "meeting_date": "2027-07-28",
+      "probabilities": [
+        0,
+        0,
+        9.86,
+        90.14
+      ],
+      "ranges": [
+        "375-400",
+        "400-425",
+        "425-450",
+        "450-475"
+      ]
+    },
+    {
+      "meeting_date": "2027-09-15",
+      "probabilities": [
+        0,
+        0,
+        17.89,
+        82.11
+      ],
+      "ranges": [
+        "375-400",
+        "400-425",
+        "425-450",
+        "450-475"
+      ]
+    },
+    {
+      "meeting_date": "2027-10-27",
+      "probabilities": [
+        0,
+        0,
+        9.86,
+        90.14
+      ],
+      "ranges": [
+        "375-400",
+        "400-425",
+        "425-450",
+        "450-475"
+      ]
+    },
+    {
+      "meeting_date": "2027-12-08",
+      "probabilities": [
+        0,
+        0,
+        44.9,
+        55.1
+      ],
+      "ranges": [
+        "375-400",
+        "400-425",
+        "425-450",
+        "450-475"
+      ]
+    }
+  ],
+  "snapshot_quikstrike": "",
+  "zq_prices": [
+    {
+      "contract": "ZQU6",
+      "settle": 96.2513
+    },
+    {
+      "contract": "ZQV6",
+      "settle": 96.1025
+    },
+    {
+      "contract": "ZQX6",
+      "settle": 95.9825
+    },
+    {
+      "contract": "ZQZ6",
+      "settle": 95.88
+    },
+    {
+      "contract": "ZQF7",
+      "settle": 95.7875
+    },
+    {
+      "contract": "ZQG7",
+      "settle": 95.69
+    },
+    {
+      "contract": "ZQH7",
+      "settle": 95.625
+    },
+    {
+      "contract": "ZQJ7",
+      "settle": 95.555
+    },
+    {
+      "contract": "ZQK7",
+      "settle": 95.455
+    },
+    {
+      "contract": "ZQM7",
+      "settle": 95.425
+    },
+    {
+      "contract": "ZQN7",
+      "settle": 95.4275
+    },
+    {
+      "contract": "ZQQ7",
+      "settle": 95.39
+    },
+    {
+      "contract": "ZQU7",
+      "settle": 95.405
+    }
+  ],
+  "snapshot_cn": "2026-09-18 05:30:00",
+  "captured_at_cn": "2026-09-18 05:30:00",
+  "collect_ct": "2026-09-17 16:30:02 CDT",
+  "effective_snapshot_cn": "2026-09-18 05:30:00",
+  "us_trade_date": "2026-09-17",
+  "data_asof_ct": "2026-09-17 04:16:54 CT",
+  "data_asof_raw": "* Data as of 17 9月 2026 04:16:54 CT"
+}
