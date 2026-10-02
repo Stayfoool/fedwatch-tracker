@@ -14,3 +14,6 @@ __pycache__/
 # 服务器端部署器状态文件
 .deploy.lock
 .node-modules.sha
+
+# WorkBuddy 项目记忆（本地协作数据，不入仓库）
+.workbuddy/

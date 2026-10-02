@@ -36,6 +36,15 @@ fi
 runuser -u "$RUN_AS" -- git merge-base --is-ancestor "$COMMIT" origin/main \
   || fail "commit 不在 origin/main 历史中：$COMMIT"
 
+# 防呆（2026-10-02 事故）：reset --hard 到 origin/main 会丢弃服务器本地
+# 领先 origin 的提交——那通常是采集成功但 sync_data_git.sh 还没推出去的数据。
+# 本地一旦领先，先拒绝部署，让数据同步先行，宁可部署晚一天也不丢数据。
+AHEAD=$(runuser -u "$RUN_AS" -- git rev-list --count origin/main..main 2>/dev/null || echo 0)
+if [[ "$AHEAD" -ne 0 ]]; then
+  fail "服务器本地 main 领先 origin/main $AHEAD 个提交（应为采集数据）。" \
+       "先修复数据回推（journalctl -u fedwatch-daily | grep sync_data_git），"
+fi
+
 CURRENT=$(runuser -u "$RUN_AS" -- git rev-parse HEAD 2>/dev/null || echo none)
 if [[ "$COMMIT" == "$CURRENT" && -f "$APP/report/index.html" ]]; then
   echo "fedwatch-deploy: 已是目标 commit $COMMIT，跳过重建"
