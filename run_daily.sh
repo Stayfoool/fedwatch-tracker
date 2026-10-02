@@ -33,11 +33,11 @@ MAX=3             # 抓取总尝试次数
 SLEEP=600         # 抓取重试间隔：10 分钟
 DEPLOY_MAX=3      # 发布总尝试次数
 DEPLOY_SLEEP=60   # 发布重试间隔：1 分钟
-# 发布渠道：默认 Cloudflare Pages（Mac 手动备用）；阿里云服务器的 systemd 服务通过
-# FEDWATCH_DEPLOY_SCRIPT 指向 publish_report.sh（本地 nginx），并通过
-# FEDWATCH_PAGES_PUBLISH=1 追加发布 pages.dev 对外门面（publish_pages.sh）。
-DEPLOY_SCRIPT=${FEDWATCH_DEPLOY_SCRIPT:-$DIR/deploy_pages.sh}
-DEPLOY_NAME=${FEDWATCH_DEPLOY_NAME:-Cloudflare Pages}
+# 发布渠道：只对接服务器生产。默认 publish_report.sh（nginx 镜像）；
+# systemd unit 里 FEDWATCH_PAGES_PUBLISH=1 时追加 publish_pages.sh（pages.dev 对外门面）。
+# Mac 不再有任何网站发布能力（deploy_pages.sh 已删除，Cloudflare token 只在服务器）。
+DEPLOY_SCRIPT=${FEDWATCH_DEPLOY_SCRIPT:-$DIR/publish_report.sh}
+DEPLOY_NAME=${FEDWATCH_DEPLOY_NAME:-nginx 镜像站}
 
 # 使用项目内固定版本的 agent-browser，避免依赖交互式 shell 的 PATH。
 export PATH="$DIR/node_modules/.bin:$PATH"

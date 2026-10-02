@@ -68,7 +68,7 @@ python3 -c "import re;h=open('report/index.html',encoding='utf-8').read();\
 open('/tmp/p.js','w').write('\n;\n'.join(re.findall(r'<script>(.*?)</script>',h,re.S)))"
 node --check /tmp/p.js                     # 图表 JS 语法校验（家规：改模板必查）
 python3 analyze_changes.py --days 7        # 必须退出码 0（全部已标注）
-./deploy_pages.sh                          # 发布 + 自检，输出须含「生产地址」与 VERIFIED
+./deploy_server.sh                         # 触发服务器重建；双路发布（nginx + pages.dev）
 ```
 
 ### 5. 收尾

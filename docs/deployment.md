@@ -2,20 +2,23 @@
 
 > 项目的整体方向、阶段和待办统一维护在根目录 `ROADMAP.md`。本文只记录部署架构、操作步骤和验证状态。
 
-## 当前架构（2026-09-30 起）
+## 当前架构（2026-10-02 起，服务器全托管发布）
 
 采集、构建、发布全部在**阿里云轻量服务器**（Debian 12，公网 `8.215.88.73`）上运行；
-Mac 只做开发，通过 GitHub 中转部署。站点为纯静态，由服务器 nginx 直接托管：
+Mac 只做开发，通过 GitHub 中转部署，**不参与任何发布**：
 
-- 公开站点：`http://8.215.88.73/`（nginx `default_server:80` → `/var/www/fedwatch/current`）
+- 对外公开网站（SEO 门面）：`https://fedwatch-tracker.pages.dev/`
+  —— 服务器每日构建后由 `publish_pages.sh`（wrangler）直发 Cloudflare Pages
+- 备用镜像：`http://8.215.88.73/`（nginx `default_server:80` → `/var/www/fedwatch/current`）
 - 代码仓库：<https://github.com/Stayfoool/fedwatch-tracker>（公开）
 - 每日采集：systemd timer `fedwatch-daily.timer`，北京时间 **05:30 与 06:30** 双触发
   （夏令时 05:30 命中、冬令时 06:30 命中芝加哥前一日 16:30 收盘窗口；不在窗口的那次由
   `fetch_quikstrike.py` 以 exit 10 自行跳过）
-- 数据回流：采集成功后服务器把新增快照/主 CSV **回推 GitHub**（读写 Deploy Key），
-  Mac 端 `git pull` 即可同步；归因任务（Mac，07:30）写完 `data/events.csv` 后
-  commit+push 并触发服务器重建
-- 旧 Cloudflare Pages 站点 `https://fedwatch-tracker.pages.dev/` 停止更新（历史存档）
+- 数据回流：采集成功后服务器把新增快照/主 CSV **回推 GitHub**（读写 Deploy Key，纯备份）；
+  归因任务（Mac，07:30）写完 `data/events.csv` 后 commit+push 并触发服务器重建
+- 两个发布目标**独立重试、互不阻断**：nginx 失败不影响 pages.dev，反之亦然
+- Cloudflare API Token 存放于服务器 `/home/fedwatch/.config/cloudflare/fedwatch-pages.token`
+  （600，fedwatch 属主）；Mac 端不再持有发布凭据
 
 ## 服务器布局
 
@@ -23,8 +26,10 @@ Mac 只做开发，通过 GitHub 中转部署。站点为纯静态，由服务�
 /opt/fedwatch-tracker          # 仓库克隆（属主 fedwatch 系统用户）
 ├── run_daily.sh               # 每日总入口（systemd 调用）
 ├── publish_report.sh          # report/ → /var/www/fedwatch/releases/<ts> + current 软链原子切换
+├── publish_pages.sh           # report/ → Cloudflare Pages（对外门面 pages.dev，wrangler 直发）
 ├── sync_data_git.sh           # 采集成功后把新数据回推 GitHub（ExecStartPost）
 └── logs/                      # logs/fetch_YYYYMMDD.log
+/home/fedwatch/.config/cloudflare/fedwatch-pages.token   # Pages API token（600）
 /var/www/fedwatch/
 ├── releases/<时间戳>/          # 每次发布的完整静态站点，保留最近 5 份
 └── current -> releases/...    # nginx root
@@ -69,19 +74,19 @@ systemctl list-timers fedwatch-daily.timer        # 查看下次触发
 
 1. **05:30 / 06:30** `fedwatch-daily.service`：`run_daily.sh` → 抓取（失败 +10/+20 分钟重试，
    最多 3 次）→ `snapshot_pick.py` 自检 → `build_report.py` → `build_curves.py` →
-   `analyze_changes.py --days 7` → `publish_report.sh` 发布 → `sync_data_git.sh`
-   把新增数据 commit+push 回 GitHub。
+   `analyze_changes.py --days 7` → `publish_report.sh`（nginx）→ `publish_pages.sh`
+   （Cloudflare Pages，独立重试互不阻断）→ `sync_data_git.sh` 把新增数据 commit+push 回 GitHub。
 2. **07:30** Mac 端 ZCode 归因自动化：`git pull --rebase` 同步数据 → 检测未归因日 →
    按 `docs/auto-attribution.md` 检索归因 → 本地构建 + JS 语法校验 →
-   commit+push → `./deploy_server.sh` 触发服务器重建发布。
+   commit+push → `./deploy_server.sh` 触发服务器重建发布（重建后同样双路发布）。
 
 ## 密钥
 
 - GitHub Deploy Key：`/etc/fedwatch/ssh/id_ed25519_github_push`（仅 fedwatch 可读，600），
   对应仓库 Deploy Key `aliyun-fedwatch-server`（read-write）；只用于数据回推。
 - 服务器 SSH：Mac `~/.ssh/config` 已有 `8.215.88.73` 别名（root + ed25519）。
-- Cloudflare API token 仍只在 Mac 本机 `~/.config/cloudflare/fedwatch-pages.token`，
-  仅 `deploy_pages.sh`（可选的 Pages 发布）使用；迁移后日常流程不再触碰 Cloudflare。
+- Cloudflare API token 只在服务器 `/home/fedwatch/.config/cloudflare/fedwatch-pages.token`
+  （600，fedwatch 属主），仅 `publish_pages.sh` 使用。Mac 已删除本地副本，不再持有发布凭据。
 
 ## 服务器初始化（已执行，存档备查）
 
@@ -113,10 +118,9 @@ bootstrap 会把 `va2t.conf` 里原来的 `default_server`（`return 444` 空吞
 
 ## 已知问题与后续
 
-- 首个自动采集日（迁移后第一个交易日）建议核对 `journalctl -u fedwatch-daily` 与
-  GitHub 上的数据回流 commit。
-- 服务器无独立域名前站点为 `http://` 明文 + 裸 IP；SEO 长期方案是绑定域名
-  （需备案）后切 `FEDWATCH_SITE_URL` 并做 301。
-- `pages.dev` 旧站冻结在 2026-09-29 数据；如需下线或 301 到新站，在 Cloudflare 控制台操作。
-- Mac 端仍可随时 `zsh run_daily.sh` + `deploy_pages.sh` 双写 Pages（需重装 LaunchAgent），
-  但注意两边数据以 GitHub 为准，先 `git pull`。
+- 首个全托管发布日（2026-10-03 05:30）建议核对 `journalctl -u fedwatch-daily`，
+  确认 nginx 与 pages.dev 两路发布均成功、GitHub 数据回流 commit 正常。
+- SEO 长期方案仍是绑定独立域名（需备案）：届时统一改 `FEDWATCH_SITE_URL`、
+  Cloudflare custom domain、301、canonical 与 sitemap（ROADMAP 有对应待办）。
+- `deploy_pages.sh` 已删除（2026-10-02）；Mac 不再有任何发布能力，Cloudflare 只认
+  服务器 token。如需回退双路，从 git 历史恢复 `deploy_pages.sh` 并重装 LaunchAgent。

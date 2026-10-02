@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # publish_report.sh — 把构建产物 report/ 发布到 nginx 站点目录（阿里云服务器使用）。
 # 通过 releases/<时间戳> + current 符号链接实现近原子切换，保留最近 5 个版本。
-# 服务器 systemd 服务通过 FEDWATCH_DEPLOY_SCRIPT 指向本脚本替代 deploy_pages.sh。
+# 服务器每日发布①（nginx 镜像）；发布② pages.dev 由 publish_pages.sh 独立执行。
 set -Eeuo pipefail
 DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 WEBROOT=${FEDWATCH_WEBROOT:-/var/www/fedwatch}
