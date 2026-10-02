@@ -47,7 +47,28 @@ fi
 
 CURRENT=$(runuser -u "$RUN_AS" -- git rev-parse HEAD 2>/dev/null || echo none)
 if [[ "$COMMIT" == "$CURRENT" && -f "$APP/report/index.html" ]]; then
-  echo "fedwatch-deploy: 已是目标 commit $COMMIT，跳过重建"
+  echo "fedwatch-deploy: 已是目标 commit $COMMIT，跳过重建（仍同步 pages.dev）"
+  SKIP_BUILD=1
+fi
+
+sync_pages() {
+  # 代码变更后同步刷新 Cloudflare Pages 对外门面（token 已配置才尝试，失败不阻断——
+  # 每日 run_daily.sh 仍会重试发布）。
+  [[ -f "$APP/publish_pages.sh" ]] || return 0
+  if runuser -u "$RUN_AS" -- test -f "/home/$RUN_AS/.config/cloudflare/fedwatch-pages.token"; then
+    if runuser -u "$RUN_AS" -- "$APP/publish_pages.sh"; then
+      echo "fedwatch-deploy: pages.dev 已同步"
+    else
+      echo "fedwatch-deploy: pages.dev 同步失败（不阻断，等每日发布重试）" >&2
+    fi
+  else
+    echo "fedwatch-deploy: 未配置 pages token，跳过 pages.dev 同步" >&2
+  fi
+}
+
+if [[ ${SKIP_BUILD:-0} = 1 ]]; then
+  sync_pages
+  echo "fedwatch-deploy: 完成（跳过重建）commit=$COMMIT site=$SITE_URL"
   exit 0
 fi
 
@@ -71,16 +92,6 @@ runuser -u "$RUN_AS" -- bash -c "cd '$APP' && python3 build_curves.py" \
   || echo "fedwatch-deploy: curves.html 生成失败（不阻断）"
 
 runuser -u "$RUN_AS" -- "$APP/publish_report.sh"
-
-# 代码变更后同步刷新 Cloudflare Pages 对外门面（token 已配置时才尝试，失败不阻断——
-# 每日 run_daily.sh 仍会重试发布）。
-if [[ -f "$APP/publish_pages.sh" ]] && runuser -u "$RUN_AS" -- test -f \
-    "/home/$RUN_AS/.config/cloudflare/fedwatch-pages.token"; then
-  if runuser -u "$RUN_AS" -- "$APP/publish_pages.sh"; then
-    echo "fedwatch-deploy: pages.dev 已同步"
-  else
-    echo "fedwatch-deploy: pages.dev 同步失败（不阻断，等每日发布重试）" >&2
-  fi
-fi
+sync_pages
 
 echo "fedwatch-deploy: 完成 commit=$COMMIT site=$SITE_URL"
