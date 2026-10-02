@@ -286,6 +286,8 @@ def extract_data() -> dict:
 POLL_MAX_SECONDS = 45
 POLL_INTERVAL_SEC = 1.5
 STABLE_NEEDED = 2
+# 默认视图（Data-as-of 戳出现）与 Aggregated 链接出现的最大等待秒数
+PAGE_READY_MAX_SECONDS = 40
 
 
 def _table_fingerprint(res: dict) -> tuple:
@@ -577,10 +579,33 @@ def run_once(dry: bool = False, force: bool = False) -> dict:
 
     ensure_browser_idle()
     final_url = open_quikstrike()
-    # 给 ASP.NET 异步加载留时间（含第三方脚本）
-    time.sleep(8)
-    asof_raw = read_page_asof()          # 必须在点击 Aggregated 之前读
-    click_aggregated_tab()
+    # 默认视图同样轮询等就绪：页面 Data-as-of 戳是默认视图独有的节点，
+    # 它出现 = 页面框架与首屏数据已渲染。固定 sleep(8) 在服务器（跨境链路
+    # 慢）上会偶发读到空页面，点击 Aggregated 直接 NO_AGGREGATED_LINK。
+    asof_raw = ""
+    ready_deadline = time.time() + PAGE_READY_MAX_SECONDS
+    while time.time() < ready_deadline:
+        asof_raw = read_page_asof()
+        if asof_raw:
+            break
+        time.sleep(POLL_INTERVAL_SEC)
+    if not asof_raw:
+        raise RuntimeError(
+            f"默认视图在 {PAGE_READY_MAX_SECONDS}s 内未出现 Data-as-of 戳，"
+            "页面未就绪（外层重试）")
+    # 点击也容忍瞬时失败（重试直到 Aggregated 链接出现）
+    clicked = False
+    click_deadline = time.time() + PAGE_READY_MAX_SECONDS
+    while time.time() < click_deadline:
+        try:
+            click_aggregated_tab()
+            clicked = True
+            break
+        except RuntimeError:
+            time.sleep(POLL_INTERVAL_SEC)
+    if not clicked:
+        raise RuntimeError(
+            f"{PAGE_READY_MAX_SECONDS}s 内未能点击 Aggregated（页面结构异常？）")
     # 轮询到表渲染稳定后再读，替代原先赌运气的固定 5 秒
     snapshot = wait_for_aggregated_stable()
     # 落盘前最后一道闸：任何自相矛盾都拒收（错位数据绝不写入 CSV）
