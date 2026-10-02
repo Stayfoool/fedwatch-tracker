@@ -18,7 +18,7 @@
 #   2. 追加写入 data/fedwatch_probabilities.csv（自动去重）
 #   3. 重建 report/index.html
 #   4. 检测重大变动（非阻断）
-#   5. deploy_pages.sh 发布并验证 fedwatch-tracker.pages.dev
+#   5. publish_report.sh 发 nginx；服务器端追加 publish_pages.sh 发 pages.dev
 #
 # 注意：历史回填已从自动流程移除。现有历史数据保留；如确需修复历史缺口，手动运行 backfill_history.py。
 
@@ -33,9 +33,11 @@ MAX=3             # 抓取总尝试次数
 SLEEP=600         # 抓取重试间隔：10 分钟
 DEPLOY_MAX=3      # 发布总尝试次数
 DEPLOY_SLEEP=60   # 发布重试间隔：1 分钟
-# 发布渠道：默认 Cloudflare Pages（Mac）；阿里云服务器的 systemd 服务通过
-# FEDWATCH_DEPLOY_SCRIPT 指向 publish_report.sh，把 report/ 发布到本地 nginx 站点。
+# 发布渠道：默认 Cloudflare Pages（Mac 手动备用）；阿里云服务器的 systemd 服务通过
+# FEDWATCH_DEPLOY_SCRIPT 指向 publish_report.sh（本地 nginx），并通过
+# FEDWATCH_PAGES_PUBLISH=1 追加发布 pages.dev 对外门面（publish_pages.sh）。
 DEPLOY_SCRIPT=${FEDWATCH_DEPLOY_SCRIPT:-$DIR/deploy_pages.sh}
+DEPLOY_NAME=${FEDWATCH_DEPLOY_NAME:-Cloudflare Pages}
 
 # 使用项目内固定版本的 agent-browser，避免依赖交互式 shell 的 PATH。
 export PATH="$DIR/node_modules/.bin:$PATH"
@@ -108,10 +110,26 @@ deploy_attempt=1
 while [[ $deploy_attempt -le $DEPLOY_MAX ]]; do
   log "=== 第 $deploy_attempt/$DEPLOY_MAX 次发布尝试 $(date '+%F %T %Z')"
   if "$DEPLOY_SCRIPT" 2>&1 | tee -a "$LOG"; then
-    log "OK 数据、报告与公开网站均已更新 $(date '+%F %T %Z')"
+    log "OK 数据、报告与 $DEPLOY_NAME 均已更新 $(date '+%F %T %Z')"
+    # 发布②：Cloudflare Pages 对外门面（仅服务器端开启，见 systemd unit 的
+    # FEDWATCH_PAGES_PUBLISH=1）。与发布①相互独立：nginx 挂不影响 pages.dev，反之亦然。
+    if [[ ${FEDWATCH_PAGES_PUBLISH:-0} = 1 ]]; then
+      pages_attempt=1
+      while [[ $pages_attempt -le $DEPLOY_MAX ]]; do
+        log "=== 第 $pages_attempt/$DEPLOY_MAX 次 Cloudflare Pages 发布 $(date '+%F %T %Z')"
+        if "$DIR/publish_pages.sh" 2>&1 | tee -a "$LOG"; then
+          log "OK pages.dev 已发布并验证 $(date '+%F %T %Z')"
+          exit 0
+        fi
+        pages_attempt=$((pages_attempt + 1))
+        [[ $pages_attempt -le $DEPLOY_MAX ]] && { log "--- ${DEPLOY_SLEEP}s 后重试"; sleep $DEPLOY_SLEEP; }
+      done
+      log "FAILED nginx 已更新，但 pages.dev 连续 $DEPLOY_MAX 次发布失败 $(date '+%F %T %Z')"
+      exit 1
+    fi
     exit 0
   fi
-  log "--- Cloudflare Pages 发布或验证失败"
+  log "--- $DEPLOY_NAME 发布或验证失败"
   deploy_attempt=$((deploy_attempt + 1))
   if [[ $deploy_attempt -le $DEPLOY_MAX ]]; then
     log "--- ${DEPLOY_SLEEP}s 后仅重试发布（不重复抓取）"
@@ -119,5 +137,5 @@ while [[ $deploy_attempt -le $DEPLOY_MAX ]]; do
   fi
 done
 
-log "FAILED 报告已在本地生成，但 Pages 发布连续失败 $DEPLOY_MAX 次 $(date '+%F %T %Z')"
+log "FAILED 报告已在本地生成，但 $DEPLOY_NAME 发布连续失败 $DEPLOY_MAX 次 $(date '+%F %T %Z')"
 exit 1

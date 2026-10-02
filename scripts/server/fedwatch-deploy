@@ -6,7 +6,7 @@ set -Eeuo pipefail
 
 APP=${APP:-/opt/fedwatch-tracker}
 RUN_AS=${RUN_AS:-fedwatch}
-SITE_URL=${FEDWATCH_SITE_URL:-http://8.215.88.73}
+SITE_URL=${FEDWATCH_SITE_URL:-https://fedwatch-tracker.pages.dev}
 LOG_DIR=/var/log/fedwatch
 REF=${1:-main}
 REQUESTED_COMMIT=${2:-}
@@ -71,4 +71,16 @@ runuser -u "$RUN_AS" -- bash -c "cd '$APP' && python3 build_curves.py" \
   || echo "fedwatch-deploy: curves.html 生成失败（不阻断）"
 
 runuser -u "$RUN_AS" -- "$APP/publish_report.sh"
+
+# 代码变更后同步刷新 Cloudflare Pages 对外门面（token 已配置时才尝试，失败不阻断——
+# 每日 run_daily.sh 仍会重试发布）。
+if [[ -f "$APP/publish_pages.sh" ]] && runuser -u "$RUN_AS" -- test -f \
+    "/home/$RUN_AS/.config/cloudflare/fedwatch-pages.token"; then
+  if runuser -u "$RUN_AS" -- "$APP/publish_pages.sh"; then
+    echo "fedwatch-deploy: pages.dev 已同步"
+  else
+    echo "fedwatch-deploy: pages.dev 同步失败（不阻断，等每日发布重试）" >&2
+  fi
+fi
+
 echo "fedwatch-deploy: 完成 commit=$COMMIT site=$SITE_URL"
