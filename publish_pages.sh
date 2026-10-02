@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# publish_pages.sh — 服务器端 Cloudflare Pages 发布（pages.dev 对外门面）。
-# 2026-10-02 起 pages.dev 的构建与发布全部由服务器完成：
-#   采集(服务器) → 构建 report/ → 本脚本直发 Cloudflare；
-#   Mac 不再参与发布（deploy_pages.sh 保留作手动备用）。
+# publish_pages.sh — 唯一发布渠道：构建产物 report/ 直发 Cloudflare Pages（pages.dev 对外门面）。
+# 链路：采集(服务器) → 构建 report/ → 本脚本直发 Cloudflare。Mac 无发布能力；
+# nginx 镜像发布已于 2026-10-02 砍掉（publish_report.sh 删除，/var/www/fedwatch 下线）。
 # 依赖：node_modules/.bin/wrangler（npm ci 自动安装）、token 文件（600）。
-# 由 run_daily.sh 在 FEDWATCH_PAGES_PUBLISH=1 时调用；也可手动执行。
+# run_daily.sh 每日调用，也可手动执行。
 set -Eeuo pipefail
 DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 cd "$DIR"

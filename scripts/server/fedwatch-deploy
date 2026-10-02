@@ -91,7 +91,7 @@ runuser -u "$RUN_AS" -- bash -c "cd '$APP' && python3 build_report.py"
 runuser -u "$RUN_AS" -- bash -c "cd '$APP' && python3 build_curves.py" \
   || echo "fedwatch-deploy: curves.html 生成失败（不阻断）"
 
-runuser -u "$RUN_AS" -- "$APP/publish_report.sh"
+# 唯一发布渠道：Cloudflare Pages（nginx 镜像发布已于 2026-10-02 移除）
 sync_pages
 
 echo "fedwatch-deploy: 完成 commit=$COMMIT site=$SITE_URL"

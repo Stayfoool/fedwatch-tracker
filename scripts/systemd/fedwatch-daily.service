@@ -9,13 +9,9 @@ User=fedwatch
 Group=fedwatch
 WorkingDirectory=/opt/fedwatch-tracker
 Environment=PYTHON_BIN=/usr/bin/python3
-# 规范地址统一为对外门面 pages.dev：sitemap/canonical/结构化数据全指向它，
-# 裸 IP nginx 面只是镜像（避免两个规范地址打架，SEO 冲突）。
+# 规范地址 = 对外门面 pages.dev：sitemap/canonical/结构化数据全指向它。
 Environment=FEDWATCH_SITE_URL=https://fedwatch-tracker.pages.dev
-Environment=FEDWATCH_DEPLOY_SCRIPT=/opt/fedwatch-tracker/publish_report.sh
-Environment=FEDWATCH_DEPLOY_NAME=nginx备用站
-# 发布②：采集构建后追加直发 Cloudflare Pages（publish_pages.sh），与 nginx 相互独立
-Environment=FEDWATCH_PAGES_PUBLISH=1
+# 唯一发布渠道：publish_pages.sh 直发 Cloudflare Pages（2026-10-02 砍掉 nginx 镜像发布）。
 ExecStart=/bin/zsh /opt/fedwatch-tracker/run_daily.sh
 ExecStartPost=/opt/fedwatch-tracker/sync_data_git.sh
 # 3 次抓取（间隔 10 分钟）+ 构建发布 + 3 次发布重试，留足余量
