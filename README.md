@@ -234,12 +234,11 @@ QuikStrike 拒绝 referer 非 cmegroup.com 的请求，
 最多 3 次。周末/节假日时 QuikStrike 显示的是上一个交易日的收盘数据，本站按最近工作日归档。
 
 任务由阿里云轻量服务器（Debian 12）上的 systemd 定时器 `fedwatch-daily.timer` 触发：
-采集和报告重建成功后，`run_daily.sh` 做两路**相互独立**的发布——`publish_report.sh` 发布到
-nginx 镜像站（`/var/www/fedwatch/current`，原子切换），`publish_pages.sh` 通过 wrangler 直发
-Cloudflare Pages；任一路失败只重试自身，互不阻断。随后 `sync_data_git.sh` 把新增数据回推
-GitHub（备份）。公开站点：**`https://fedwatch-tracker.pages.dev/`**（SEO 门面）；
-镜像：`http://8.215.88.73/`。发布只在服务器上发生，Mac 不持有任何发布凭据。
-部署细节见 `docs/deployment.md`。
+采集和报告重建成功后，`run_daily.sh` 调用 `publish_pages.sh`，通过 wrangler 把 `report/`
+直发 Cloudflare Pages——这是**唯一发布渠道**。随后 `sync_data_git.sh` 把新增数据回推
+GitHub（备份）。公开站点：**`https://fedwatch-tracker.pages.dev/`**。
+nginx 镜像站已于 2026-10-02 退役（裸 IP:80 恢复 444 空吞）。发布只在服务器上发生，
+Mac 不持有任何发布凭据。部署细节见 `docs/deployment.md`。
 
 ## 七、采集流程
 
@@ -268,7 +267,6 @@ fedwatch-tracker/
 ├── site_seo.py                          # 生成内容页、metadata、sitemap、robots、CSV 等
 ├── run_daily.sh                         # 每日采集→构建→发布总入口（服务器；渠道由环境变量切换）
 ├── deploy_server.sh                     # Mac 端部署触发：让阿里云服务器从 GitHub 拉取重建
-├── publish_report.sh                    # 服务器端：report/ 原子发布到 nginx 镜像目录
 ├── publish_pages.sh                     # 服务器端：report/ 直发 Cloudflare Pages（对外门面）
 ├── sync_data_git.sh                     # 服务器端：采集成功后把新数据回推 GitHub
 ├── install_launchagent.sh               # （已退役）Mac 本地采集回切方案：安装 05:30/06:30 LaunchAgent
@@ -342,7 +340,7 @@ $PY $DIR/backfill_history.py            # 需要时手动回填 1 年历史（�
 $PY $DIR/analyze_changes.py             # 检测 ≥8pp 的重大变动日（最近 30 天）
 $PY $DIR/analyze_changes.py --days 7    # 只看最近 7 天
 $PY $DIR/build_report.py                # 重建并验证完整 report/ 静态站点
-./deploy_server.sh                        # 推送后一键部署：服务器拉取、构建、双路发布
+./deploy_server.sh                        # 推送后一键部署：服务器拉取、构建、发布 pages.dev
 # （网站发布只在服务器上发生：nginx 镜像 + Cloudflare Pages 对外门面；
 #   Mac 已退出发布链路，deploy_pages.sh 已删除。）
 # Cloudflare Token 只存在于服务器 /home/fedwatch/.config/cloudflare/fedwatch-pages.token

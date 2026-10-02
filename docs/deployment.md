@@ -7,9 +7,10 @@
 采集、构建、发布全部在**阿里云轻量服务器**（Debian 12，公网 `8.215.88.73`）上运行；
 Mac 只做开发，通过 GitHub 中转部署，**不参与任何发布**：
 
-- 对外公开网站（SEO 门面）：`https://fedwatch-tracker.pages.dev/`
+- 对外公开网站（**唯一发布渠道**）：`https://fedwatch-tracker.pages.dev/`
   —— 服务器每日构建后由 `publish_pages.sh`（wrangler）直发 Cloudflare Pages
-- 备用镜像：`http://8.215.88.73/`（nginx `default_server:80` → `/var/www/fedwatch/current`）
+- nginx 镜像站已退役（2026-10-02）：`fedwatch.conf` 下线、裸 IP:80 恢复 444 空吞、
+  `/var/www/fedwatch` 移除
 - 代码仓库：<https://github.com/Stayfoool/fedwatch-tracker>（公开）
 - 每日采集：systemd timer `fedwatch-daily.timer`，北京时间 **05:30 与 06:30** 双触发
   （夏令时 05:30 命中、冬令时 06:30 命中芝加哥前一日 16:30 收盘窗口；不在窗口的那次由
@@ -25,17 +26,12 @@ Mac 只做开发，通过 GitHub 中转部署，**不参与任何发布**：
 ```text
 /opt/fedwatch-tracker          # 仓库克隆（属主 fedwatch 系统用户）
 ├── run_daily.sh               # 每日总入口（systemd 调用）
-├── publish_report.sh          # report/ → /var/www/fedwatch/releases/<ts> + current 软链原子切换
-├── publish_pages.sh           # report/ → Cloudflare Pages（对外门面 pages.dev，wrangler 直发）
+├── publish_pages.sh           # report/ → Cloudflare Pages（唯一发布渠道，pages.dev）
 ├── sync_data_git.sh           # 采集成功后把新数据回推 GitHub（ExecStartPost）
 └── logs/                      # logs/fetch_YYYYMMDD.log
 /home/fedwatch/.config/cloudflare/fedwatch-pages.token   # Pages API token（600）
-/var/www/fedwatch/
-├── releases/<时间戳>/          # 每次发布的完整静态站点，保留最近 5 份
-└── current -> releases/...    # nginx root
 /etc/fedwatch/ssh/             # GitHub 读写 Deploy Key（fedwatch 私有，600）
 /etc/systemd/system/fedwatch-daily.{service,timer}
-/etc/nginx/conf.d/fedwatch.conf  # 接管裸 IP:80 default_server
 /usr/local/sbin/fedwatch-deploy  # root 运行的部署器（Mac deploy_server.sh 触发）
 /var/log/fedwatch/deploy.log     # 部署日志
 ```
