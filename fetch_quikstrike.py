@@ -40,6 +40,7 @@ import argparse
 import csv
 import datetime as dt
 import json
+import re
 import subprocess
 import sys
 import time
@@ -191,33 +192,42 @@ EXTRACT_JS = r"""
   const out = {meetings: [], zq_prices: [], snapshot_quikstrike: ''};
   for (const t of document.querySelectorAll('table')) {
     const txt = t.textContent;
-    if (txt.includes('ZQU6') && txt.includes('ZQV6')) {
-      const cells = [...t.querySelectorAll('th, td')].map(c => c.textContent.trim());
-      const contracts = cells.filter(s => /^ZQ[FGHJKMNQUVXZ]\d$/.test(s));
-      const prices = cells.filter(s => /^\d+\.\d+$/.test(s)).map(parseFloat);
-      out.zq_prices = contracts.map((c, i) => ({contract: c, settle: prices[i]}));
+    // 期货表：默认视图里每个会议各一行（只有 1 个合约），点击 Aggregated 后
+    // 才展开成单行的 13 合约宽表。旧判据要求同时出现 ZQU6 与 ZQV6，在默认
+    // 视图恒不成立 → 抓到 0 条。改为「合约数 >= 10」才算宽表。
+    const cells = [...t.querySelectorAll('th, td')].map(c => c.textContent.trim());
+    const contracts = cells.filter(s => /^ZQ[FGHJKMNQUVXZ]\d$/.test(s));
+    if (contracts.length >= 10) {
+      // 价格与合约同表且顺序一一对应，按下标配对；只接受 90~100 的期货价
+      const prices = cells.filter(s => /^\d+\.\d{3,4}$/.test(s)).map(parseFloat);
+      out.zq_prices = contracts
+        .map((c, i) => ({contract: c, settle: prices[i]}))
+        .filter(z => Number.isFinite(z.settle));
     }
     if (txt.includes('Aggregated Meeting Probabilities')) {
       const rows = [...t.querySelectorAll('tr')];
       let headers = [];
       for (const r of rows) {
-        const cells = [...r.querySelectorAll('th, td')].map(c => c.textContent.trim());
-        if (cells[0] && cells[0].toLowerCase() === 'meeting date') {
-          headers = cells; break;
-        }
+        const c = [...r.querySelectorAll('th, td')].map(x => x.textContent.trim());
+        if (c[0] && c[0].toLowerCase() === 'meeting date') { headers = c; break; }
       }
+      const nCols = headers.length - 1;   // 表头声明的区间数
       for (const r of rows) {
-        const cells = [...r.querySelectorAll('th, td')].map(c => c.textContent.trim());
+        const c = [...r.querySelectorAll('th, td')].map(x => x.textContent.trim());
         // 会话区域格式两种都可能：YYYY/M/D（zh-CN）或 M/D/YYYY（en-US）
-        const m = cells[0] && (cells[0].match(/^(\d{4})\/(\d+)\/(\d+)$/) || cells[0].match(/^(\d+)\/(\d+)\/(\d{4})$/));
+        const m = c[0] && (c[0].match(/^(\d{4})\/(\d+)\/(\d+)$/) || c[0].match(/^(\d+)\/(\d+)\/(\d{4})$/));
         if (m) {
-          const probs = cells.slice(1).map(s => parseFloat(s));
-          const parts = /^\d{4}\//.test(cells[0]) ? [m[1], m[2], m[3]] : [m[3], m[1], m[2]];
+          const probs = c.slice(1).map(s => parseFloat(s));
+          const parts = /^\d{4}\//.test(c[0]) ? [m[1], m[2], m[3]] : [m[3], m[1], m[2]];
           const ymd = parts[0] + '-' + String(parts[1]).padStart(2,'0') + '-' + String(parts[2]).padStart(2,'0');
           out.meetings.push({
             meeting_date: ymd,
             ranges: headers.slice(1),
             probabilities: probs,
+            // 每行自带列数，供 Python 侧校验：列数与表头不符 = 加载中间态
+            n_cells: probs.length,
+            n_cols: nCols,
+            sum: probs.reduce((a, b) => a + b, 0),
           });
         }
       }
@@ -268,7 +278,128 @@ def extract_data() -> dict:
     return res
 
 
+# 轮询等待：点击 Aggregated 后 ASP.NET 异步渲染，渲染途中会短暂出现一张
+# 「多一列」的中间态表（2026-10-02 实测：真实 4 列，中间态 5 列，值整体右移
+# 一格，2027-12 会议因此偏差 70pp）。固定 sleep 赌运气命中中间态就会静默写入
+# 错位数据，且没有任何下游校验能拦住。这里改为轮询到「连续 STABLE_NEEDED 次
+# 读到完全相同的表头与行数」才认为渲染完成。
+POLL_MAX_SECONDS = 45
+POLL_INTERVAL_SEC = 1.5
+STABLE_NEEDED = 2
+
+
+def _table_fingerprint(res: dict) -> tuple:
+    """用 (列数, 会议数, 每行列数, 每行和) 作为渲染完成的指纹。"""
+    ms = res.get("meetings") or []
+    if not ms:
+        return ()
+    return tuple(
+        (m.get("n_cols"), m.get("n_cells"),
+         tuple(sorted({m.get("n_cells", -1) for m in ms})),
+         tuple(round(m.get("sum", 0.0), 2) for m in ms))
+        for m in ms
+    )
+
+
+def wait_for_aggregated_stable() -> dict:
+    """轮询直到 Aggregated 表渲染稳定，返回该表数据。超时抛错（外层重试）。"""
+    deadline = time.time() + POLL_MAX_SECONDS
+    prev_fp = None
+    stable = 0
+    last = None
+    while time.time() < deadline:
+        try:
+            res = extract_data()
+        except RuntimeError as e:
+            last = e
+            res = None
+        if res:
+            last = None
+            fp = _table_fingerprint(res)
+            if fp and fp == prev_fp:
+                stable += 1
+                if stable >= STABLE_NEEDED:
+                    return res
+            else:
+                stable = 0
+                prev_fp = fp
+        time.sleep(POLL_INTERVAL_SEC)
+    raise RuntimeError(
+        f"Aggregated 表在 {POLL_MAX_SECONDS}s 内未渲染稳定（可能始终命中中间态）"
+        + (f"；最后一次错误: {last}" if last else ""))
+
+
 # ---------------- 数据加工 ----------------
+
+SUM_TOLERANCE_PP = 0.5   # 每行概率和允许的偏差（百分点）
+MIN_MEETINGS = 8        # FOMC 未来会议数下限，少于此说明表格没加载全
+RANGE_RE = re.compile(r"^\d{3,4}-\d{3,4}$")   # 合法区间标签，如 375-400
+
+
+def validate_snapshot(snapshot: dict) -> None:
+    """落盘前一致性校验。任何一项不过就抛错，让外层重试。
+
+    用四条互相独立的判据，把「读歪」的数据挡在门外：
+      1. 每行概率和 ≈ 100%
+      2. 每个区间标签合法，且严格升序、宽度一致（直接抓列错位/列被截断）
+      3. 各会议行列数一致（渲染中间态会行宽不一）
+      4. 会议数量达到下限（表没加载全）
+    """
+    ms = snapshot.get("meetings") or []
+    if len(ms) < MIN_MEETINGS:
+        raise RuntimeError(
+            f"只抽到 {len(ms)} 个会议，少于下限 {MIN_MEETINGS}：表格未加载完整")
+
+    problems = []
+    for m in ms:
+        d = m.get("meeting_date", "?")
+        probs = m.get("probabilities") or []
+        ranges = m.get("ranges") or []
+        n_cells = m.get("n_cells", len(probs))
+        n_cols = m.get("n_cols", 0)
+
+        if any(p is None or p != p for p in probs):   # None / NaN
+            problems.append(f"{d}: 含无法解析的数值 {probs}")
+            continue
+
+        # 判据 2：区间标签必须合法、升序、等宽。表被横向裁切时末列标签会丢，
+        # 或列错位时标签与数值对不上 —— 都在这里暴露。
+        bad_labels = [x for x in ranges if not RANGE_RE.match(str(x))]
+        if bad_labels:
+            problems.append(f"{d}: 非法区间标签 {bad_labels}")
+        else:
+            los = [int(str(x).split("-")[0]) for x in ranges]
+            his = [int(str(x).split("-")[1]) for x in ranges]
+            if los != sorted(los):
+                problems.append(f"{d}: 区间未按下限升序 {ranges}")
+            widths = {hi - lo for lo, hi in zip(los, his)}
+            if len(widths) > 1:
+                problems.append(f"{d}: 区间宽度不一致 {sorted(widths)}")
+            if los and his and any(hi <= lo for lo, hi in zip(los, his)):
+                problems.append(f"{d}: 区间上下界颠倒 {ranges}")
+
+        if n_cols and n_cells != n_cols:
+            problems.append(
+                f"{d}: 列错位 —— 数据 {n_cells} 个值 vs 表头 {n_cols} 个区间")
+        if ranges and n_cells != len(ranges):
+            problems.append(
+                f"{d}: 数值个数 {n_cells} 与区间标签数 {len(ranges)} 不符")
+        total = sum(probs)
+        if abs(total - 100.0) > SUM_TOLERANCE_PP:
+            problems.append(f"{d}: 概率和 {total:.2f}% 偏离 100% 超过 "
+                            f"{SUM_TOLERANCE_PP}pp")
+
+    # 判据 3：真实表里每一行的列数必然相同（同一张表、同一组表头）。
+    # 渲染中间态会出现「部分行已多出一列、部分行还没有」的行宽不一致 ——
+    # 这种表自身每行和仍是 100%，光靠其他几条抓不住。
+    widths = {m.get("n_cells", len(m.get("probabilities") or [])) for m in ms}
+    if len(widths) > 1:
+        problems.append(
+            f"各会议行的列数不一致 {sorted(widths)} —— 命中渲染中间态")
+
+    if problems:
+        raise RuntimeError("快照一致性校验失败：\n  - " + "\n  - ".join(problems))
+
 
 def to_rows(snapshot: dict, snapshot_cn: str, us_trade_date: str,
             asof_raw: str, cur_target: str) -> list[dict]:
@@ -450,8 +581,10 @@ def run_once(dry: bool = False, force: bool = False) -> dict:
     time.sleep(8)
     asof_raw = read_page_asof()          # 必须在点击 Aggregated 之前读
     click_aggregated_tab()
-    time.sleep(5)
-    snapshot = extract_data()
+    # 轮询到表渲染稳定后再读，替代原先赌运气的固定 5 秒
+    snapshot = wait_for_aggregated_stable()
+    # 落盘前最后一道闸：任何自相矛盾都拒收（错位数据绝不写入 CSV）
+    validate_snapshot(snapshot)
     asof_ct = parse_page_asof(asof_raw)
     fresh, fresh_note = asof_freshness(asof_ct, now_ct())
 
